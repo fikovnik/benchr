@@ -1,31 +1,148 @@
+import abc
+import argparse
+import pprint
+import subprocess
+import types
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Self, TextIO, Any
+from typing import Any, Optional, TextIO, Callable
+
+# --------------------------------------
+#           DEFINITIONS
+# --------------------------------------
 
 Env = dict[str, str]
 
+Parameters = types.SimpleNamespace
+
+# --------------------------------------
+#           HELPER
+# --------------------------------------
+
+
+def run_cmd(*args, **kwargs):
+    """
+    Run a very simple command, wrapper around subprocess.run
+    """
+    return subprocess.run(*args, check=True, **kwargs)
+
+
+# --------------------------------------
+#           UI
+# --------------------------------------
+
+
+class Reporter:
+    def new_run(self): ...
+
+    def failed_run(
+        self,
+        command: list[str],
+        info: dict[str, str],
+        msg: str,
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+    ): ...
+
+    def finished_run(
+        self,
+        command: list[str],
+        info: dict[str, str],
+        stdout: str,
+        stderr: str,
+    ): ...
+
+
+# --------------------------------------
+#           EXECUTORS
+# --------------------------------------
+
 
 class Executor:
-    explicit: bool
+    """
+    The main Executor, which executes given commands, reporting success or
+    failures to reporter
+    """
 
-    def __init__(self, explicit: bool) -> None:
-        self.explicit = explicit
+    reporter: Reporter
 
     def execute(
         self,
         command: list[str],
-        folder: Path,
+        working_directory: Path,
         env: Env,
         info: dict[str, str],
-    ): ...
+    ):
+        self.reporter.new_run()
+
+        cmd = shutil.which(command[0])
+        if cmd is None:
+            self.reporter.failed_run(command, info, "Command does not exist")
+            return
+
+        command[0] = cmd
+
+        proc = None
+        try:
+            # TODO: group, process group?
+            proc = subprocess.run(
+                command,
+                # run spec
+                capture_output=True,
+                check=False,
+                # Popen spec
+                stdin=None,
+                shell=False,
+                cwd=working_directory,
+                env=env,
+                text=True,
+            )
+
+            if proc.returncode != 0:
+                self.reporter.failed_run(
+                    command,
+                    info,
+                    f"Non-zero return code ({proc.returncode})",
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
+                )
+
+            self.reporter.finished_run(command, info, proc.stdout, proc.stderr)
+
+        except OSError as e:
+            self.reporter.failed_run(
+                command,
+                info,
+                f"OSError: {e.strerror or ''}",
+                stdout=proc.stdout if proc is not None else None,
+                stderr=proc.stderr if proc is not None else None,
+            )
+
+
+class DryExecutor(Executor):
+    def execute(
+        self,
+        command: list[str],
+        working_directory: Path,
+        env: Env,
+        info: dict[str, str],
+    ):
+        print("Run:", " ".join(command))
+        print("Working working_directory:", str(working_directory))
+        print("Environment: ", end="")
+        pprint.pprint(env)
+        print("Info: ", end="")
+        pprint.pprint(info)
+        print("-" * 10)
 
 
 class ParallelExecutor(Executor):
     pool: ThreadPoolExecutor
 
-    def __init__(self, explicit: bool, ncores: int) -> None:
-        super().__init__(explicit)
+    def __init__(self, ncores: int) -> None:
+        super().__init__()
         self.pool = ThreadPoolExecutor(max_workers=ncores)
 
     def execute(self, *args, **kwargs):
@@ -40,22 +157,20 @@ class ParallelExecutor(Executor):
 
 
 # TODO: parsing results
-class BenchmarkRunner(Executor):
+class BenchmarkExecutor(Executor):
     result_path: Path
     result: TextIO
     csv_headers: list[str]
 
-    def __init__(
-        self, explicit: bool, result_path: Path, csv_headers: list[str]
-    ) -> None:
-        super().__init__(explicit)
+    def __init__(self, result_path: Path, csv_headers: list[str]) -> None:
+        super().__init__()
         self.result_path = result_path
         self.csv_headers = csv_headers
 
     def execute(
         self,
         command: list[str],
-        folder: Path,
+        working_directory: Path,
         env: Env,
         info: dict[str, str],
     ): ...
@@ -73,211 +188,253 @@ class BenchmarkRunner(Executor):
 
 
 # --------------------------------------
-
-CWD = Path(__file__)
-
-
-Matrix = dict[str, list[str]]
-
-
-class Parser: ...
+#          DATA DEFINITIONS
+# --------------------------------------
 
 
 @dataclass
 class Benchmark:
+    """
+    A definition of one benchmark. data can be any benchmark-specific data
+    that are needed for its execution.
+    """
+
     name: str
+    data: tuple[Any, ...]
 
-    command: list[str]
-    folder: Path
-    env: Env
-    matrix: Matrix
-    parser: Parser
+    def __init__(self, name: str, *data: Any) -> None:
+        self.name = name
+        self.data = data
 
 
-@dataclass
-class Suite:
+B = Benchmark
+
+
+class Suite(abc.ABC):
+    """
+    A collection of benchmarks. They should all be connected with similar
+    structure.
+
+    The mk_command needs to implemented, providing a command that should be
+    executed, unique for each benchmark.
+
+    Environment can be defined statically (with env) or per benchmark (by
+    overriding mk_env), or defaults to empty.
+
+    Similarly, working directory can be either specified statically with
+    working_directory, or by overriding mk_working_directory. If none of these
+    is defined, configuration needs to provide a working directory.
+    """
+
     name: str
     benchmarks: list[Benchmark]
 
+    working_directory: Optional[Path] = None
+    env: Env = {}
 
-@dataclass
+    def mk_working_directory(
+        self, parameters: Parameters, benchmark: Benchmark
+    ) -> Optional[Path]:
+        return self.working_directory
+
+    def mk_env(self, parameters: Parameters, benchmark: Benchmark) -> Env:
+        return self.env
+
+    @abc.abstractmethod
+    def mk_command(self, parameters: Parameters, benchmark: Benchmark) -> list[str]: ...
+
+
 class Config:
+    """
+    The full configuration of all suites.
+
+    If a suite does not provide a working directory, it can be specified in
+    here, either statically (with working_directory), or dynamically with
+    mk_working_directory.
+
+    Specifying an environment through env merges it with the environment
+    provided by the suite. Alternatively, mk_env can be overriden to modify
+    the behavior per benchmark.
+    """
+
     suites: list[Suite]
 
+    working_directory: Optional[Path]
+    env: Env
 
-Variables = dict[str, str]
-RecVariables = str | dict[str, "RecVariables"]
+    def __init__(
+        self,
+        *suites: Suite,
+        working_directory: Optional[Path] = None,
+        env: Env = {},
+    ):
+        if len(suites) == 0:
+            raise ValueError("No suites defined!")
 
+        for suite in suites:
+            if len(suite.benchmarks) == 0:
+                raise ValueError(f"Suite {suite.name} has no benchmarks!")
 
-class ConfigDecodeError(Exception):
-    message: str
+        self.suites = list(suites)
+        self.working_directory = working_directory
+        self.env = env
 
-    def __init__(self, message: str) -> None:
-        self.message = message
-        super().__init__(message)
+    def mk_working_directory(
+        self, parameters: Parameters, suite: Suite, benchmark: Benchmark
+    ) -> Path:
+        working_directory = suite.mk_working_directory(parameters, benchmark)
+        if working_directory is not None:
+            return working_directory
 
-    def extend(self, message: str) -> "ConfigDecodeError":
-        return ConfigDecodeError(f"{message}: {self.message}")
+        if self.working_directory is not None:
+            return self.working_directory
 
+        raise ValueError("Working directory is not defined!")
 
-@dataclass
-class IncompleteFields:
-    command: Optional[list[str]] = None
-    folder: Optional[Path] = None
-    env: Optional[Env] = None
-    matrix: Optional[Matrix] = None
-    variables: Variables = dict()
-    parser: Optional[Parser] = None
-
-
-@dataclass
-class IncompleteBenchmark:
-    name: str
-    incomplete_fields: IncompleteFields = IncompleteFields()
-
-
-@dataclass
-class IncompleteSuite:
-    name: str
-    benchmarks: list[IncompleteBenchmark] = list()
-    incomplete_fields: IncompleteFields = IncompleteFields()
+    def mk_env(self, parameters: Parameters, suite: Suite, benchmark: Benchmark) -> Env:
+        return self.env | suite.mk_env(parameters, benchmark)
 
 
-@dataclass
-class IncompleteConfig:
-    suites: list[IncompleteSuite] = list()
-    parameters: list[str] = list()
-    incomplete_fields: IncompleteFields = IncompleteFields()
+# --------------------------------------
+#          ARGUMENT PARSING
+# --------------------------------------
 
 
-def assert_decode_type(obj: Any, *types, msg: Optional[str] = None) -> None:
-    if not isinstance(obj, *types):
-        if len(types) > 1:
-            t_msg = f"{', '.join(types)}"
-        else:
-            t_msg = f"{types}"
+def make_argparser(*params: str, **kwarg_params: Any) -> argparse.ArgumentParser:
+    """
+    Create a default argument parser from the given parameters
+    """
+    parser = argparse.ArgumentParser()
+    user = parser.add_argument_group("User specified parameters")
 
-        raise ConfigDecodeError(
-            f"{'' if msg is None else msg}: Incorrect type, expected {t_msg}, got {type(obj)}"
+    for p in params:
+        user.add_argument(
+            f"--{p}",
+            metavar="str",
+            type=str,
+            required=True,
+            dest=p,
         )
 
+    for k, v in kwarg_params.items():
+        t = type(v) if v is not None else str
+        user.add_argument(
+            f"--{k}",
+            help=f"(Default: {v})",
+            metavar=t.__name__,
+            type=t,
+            default=v,
+            dest=k,
+        )
 
-def flatten_variables(vars: dict[str, RecVariables]) -> Variables:
-    assert_decode_type(vars, dict)
-
-    res: Variables = {}
-    for k, v in vars.items():
-        assert_decode_type(k, str)
-        assert_decode_type(v, str, dict)
-
-        if isinstance(v, str):
-            res[k] = v
-        else:
-            v = flatten_variables(v)
-            for k2, v2 in v.items():
-                res[f"{k}.{k2}"] = v2
-
-    return res
+    return parser
 
 
-def decode_fields(obj) -> IncompleteFields:
-    assert_decode_type(obj, dict)
-    res = IncompleteFields()
-
-    return res
-
-
-def decode_benchmark(obj) -> IncompleteBenchmark: ...
+def namespace_to_parameters(ns: argparse.Namespace) -> Parameters:
+    """
+    Convert the argparse.Namespace to Parameters (aka SimpleNamespace)
+    """
+    return Parameters(**vars(ns))
 
 
-def decode_suite(obj, name) -> IncompleteSuite:
-    assert_decode_type(name, str)
+def parse_params(*params: str, **kwarg_params: Any) -> Parameters:
+    """
+    Create a default argument parser and run it on argv
+    """
+    parser = make_argparser(*params, **kwarg_params)
+    args = parser.parse_args()
+    return namespace_to_parameters(args)
 
-    try:
-        assert_decode_type(obj, dict)
-        res = IncompleteSuite(name=name)
 
-        if "benchmarks" not in obj:
-            raise ConfigDecodeError("Missing benchmarks in suite")
+# --------------------------------------
+#          DEFAULT RUN
+# --------------------------------------
 
+
+DEFAULT_CSV_HEADERS = ["benchmark", "suite"]
+
+
+def default_mk_info(benchmark: Benchmark, suite: Suite) -> dict[str, str]:
+    return {"benchmark": benchmark.name, "suite": suite.name}
+
+
+def run_config(
+    executor: Executor,
+    conf: Config,
+    params: Parameters,
+    mk_info: Callable[[Benchmark, Suite], dict[str, str]],
+) -> None:
+    """
+    Run a given config on the executor and with the given parameters and info
+    """
+    for suite in conf.suites:
         try:
-            benchs = obj["benchmarks"]
-            assert_decode_type(benchs, list)
-            res.benchmarks = [decode_benchmark(bench) for bench in benchs]
-        except ConfigDecodeError as e:
-            raise e.extend("In benchmarks")
+            for bench in suite.benchmarks:
+                try:
+                    cmd = suite.mk_command(params, bench)
+                    env = conf.mk_env(params, suite, bench)
+                    working_directory = conf.mk_working_directory(params, suite, bench)
 
-        return res
+                    executor.execute(
+                        cmd,
+                        working_directory,
+                        env,
+                        mk_info(bench, suite),
+                    )
+                except ValueError as e:
+                    e.add_note(f"In benchmark {bench.name}")
+                    raise
 
-    except ConfigDecodeError as e:
-        raise e.extend(f"In suite {name}")
-
-
-def decode_config(obj) -> IncompleteConfig:
-    assert_decode_type(obj, dict, msg="Top configuration")
-
-    res = IncompleteConfig()
-
-    if "suites" not in obj:
-        raise ConfigDecodeError("Missing suites in configuration")
-
-    suites = obj["suites"]
-    try:
-        assert_decode_type(suites, dict)
-
-        res.suites = [decode_suite(suite, name) for suite, name in suites.items()]
-    except ConfigDecodeError as e:
-        raise e.extend("In suites")
-
-    res.parameters = obj.get("parameters", list())
-    assert_decode_type(res.parameters, list, msg="Parameters")
-
-    if "default" in obj:
-        try:
-            res.incomplete_fields = decode_fields(obj["default"])
-        except ConfigDecodeError as e:
-            raise e.extend("In default")
-
-    if "variables" in obj:
-        try:
-            res.incomplete_fields.variables |= flatten_variables(obj["variables"])
-        except ConfigDecodeError as e:
-            raise e.extend("In variables")
-
-    return res
+        except ValueError as e:
+            e.add_note(f"In suite {suite.name}")
+            raise
 
 
-# Everything always propagates from bottom up (Config -> Suite -> Benchmark):
-# Available at all levels (default, suites.<name>, suites.<name>.benchmarks.<idx>):
-#   command - list of strings, required
-#   parser - string, required
-#   working_directory - string, defaults to {cwd}
-#   env - dictionary of strings, defaults to empty
-#   matrix - dictionary of lists of strings, defaults to empty
-#   extra - dictionary of strings, defaults to empty
-#
-# Top level:
-#   parameters - list of strings
-#   variables - dictionary of strings
-#   default - dictionary
-#   suites - definition of suites, dictonary of `suite`
-#
-# `suite`:
-#   benchmarks - list of `benchmark` or string
-#
-# `benchmark`:
-#   name - string, required
-#
-# Config exceptions:
-#   Benchmark only specified as a string is equal to dictionary of only the name
-#
-# Substitution:
-#   "cwd" - working directory
-#   "matrix" - dictionary of currently active matrix fields
-#   "suite" - the current suite
-#   "benchmark" - the current benchmark
-#   everything specified in "variables"
-#   "extra" either as a dictionary or single string
+def main(config: Config, *params: str, **kwarg_params: Any) -> None:
+    """
+    Sane default main. config is the benchmarks configuration that will be
+    executed, params is a list of required parameters from the user,
+    kwarg_params are optional parameters with their default value.
+    """
+    parser = make_argparser(*params, **kwarg_params)
 
-if __name__ == "__main__":
-    print("Hello world")
+    defp = parser.add_argument_group("Default benchr parameters")
+    defp.add_argument(
+        "--output",
+        help="Where to store the results (Default: ./output)",
+        metavar="file",
+        type=str,
+        default="./output",
+        dest="__output",
+    )
+    defp.add_argument(
+        "--jobs",
+        "-j",
+        help="Allow this many runs in parallel (Default: 1)",
+        metavar="jobs",
+        type=int,
+        default=1,
+        dest="__jobs",
+    )
+    defp.add_argument(
+        "--dry",
+        help="Do not run; only print what would be runned",
+        action="store_true",
+        dest="__dry",
+    )
+    defp.add_argument(
+        "--verbose",
+        help="Be more verbose with output",
+        action="store_true",
+        dest="__verbose",
+    )
+
+    ps = namespace_to_parameters(parser.parse_args())
+
+    # TODO: Threading, verbose
+
+    if ps.__dry:
+        run_config(DryExecutor(), config, ps, default_mk_info)
+    else:
+        with BenchmarkExecutor(Path(ps.__output), DEFAULT_CSV_HEADERS) as executor:
+            run_config(executor, config, ps, default_mk_info)

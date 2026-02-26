@@ -376,7 +376,7 @@ def benchmark(
         f"benchmark_{experiment_name}.tsv" if experiment_name != "" else "benchmark.tsv"
     )
 
-    with benchr.BenchmarkRunner(
+    with benchr.BenchmarkExecutor(
         explicit_executor,
         results_folder / result_csv,
         ["benchmark", "suite"],
