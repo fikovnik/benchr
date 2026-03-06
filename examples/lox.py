@@ -7,11 +7,12 @@ conf = Config(
     Suite(
         name="LoxSuite",
         working_directory=lambda ps, _: ps.cwd / "benchmarks",
+        parser=benchr.LastLineParser(benchr.PlainSecondsParser()),
         command=lambda params, bench: [
             params.lox,
             f"{bench.name}.lox",
         ],
-        benchmarks=[
+        benchmarks=lambda ps: [
             B("binary_trees"),
             B("equality"),
             B("fib"),
@@ -22,7 +23,7 @@ conf = Config(
             B("string_equality"),
             B("zoo_batch"),
             B("zoo"),
-        ],
+        ], # [  ]
     )
 )
 

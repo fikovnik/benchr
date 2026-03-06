@@ -23,7 +23,7 @@ Command = list[str]
 
 
 class Parameters(SimpleNamespace):
-    def __or__(self, other: "Parameters", /) -> "Parameters":
+    def __or__(self, other: "Parameters") -> "Parameters":
         return Parameters(**vars(self), **vars(other))
 
 
@@ -51,23 +51,17 @@ class Run:
     suite: str
 
     command: Command
+    parser: "ResultParser"
     working_directory: Path
     env: Env
     info: dict[str, str]
 
     def as_identifier(self) -> str:
-        id = f"{self.suite}, {self.benchmark_name}"
+        id = f"{self.suite},{self.benchmark_name}"
 
-        some_info = False
-        for k, v in self.info.items():
-            if not some_info:
-                id += " ("
-                some_info = True
-            else:
-                id += ", "
-            id += f"{k}={v}"
-
-        if some_info:
+        if len(self.info) != 0:
+            id += " ("
+            id += ", ".join((f"{k}={v}" for k, v in self.info.items()))
             id += ")"
 
         return id
@@ -94,8 +88,6 @@ class Benchmark:
 
 B = Benchmark
 
-type SuiteFactory[T] = Callable[[Parameters, Benchmark], T]
-
 
 # TODO: Maybe allow benchmark to be only string
 @dataclass
@@ -105,10 +97,13 @@ class Suite:
     structure.
     """
 
+    type SuiteFactory[T] = Callable[[Parameters, Benchmark], T]
+
     name: str
     benchmarks: list[Benchmark]
 
     command: SuiteFactory[Command]
+    parser: "ResultParser"
 
     working_directory: Optional[SuiteFactory[Path] | Path] = None
     env: SuiteFactory[Env] | Env = dataclasses.field(default_factory=dict)
@@ -121,9 +116,6 @@ class Suite:
         return self.command(parameters, benchmark)
 
 
-type ConfigFactory[T] = Callable[[Parameters, Suite, Benchmark], T]
-
-
 def default_info(p: Parameters, s: Suite, b: Benchmark) -> dict[str, str]:
     return {}
 
@@ -133,6 +125,8 @@ class Config:
     """
     The full configuration of all suites.
     """
+
+    type ConfigFactory[T] = Callable[[Parameters, Suite, Benchmark], T]
 
     suites: list[Suite]
 
@@ -197,6 +191,7 @@ def config_to_runs(config: Config, parameters: Parameters) -> list[Run]:
                     benchmark_name=bench.name,
                     suite=suite.name,
                     command=command,
+                    parser=suite.parser,
                     working_directory=wd,
                     env=env,
                     info=info,
@@ -439,7 +434,7 @@ class TUI:
     if sys.stdout.isatty():
         # TODO:
         # RESET_LINE = "\r"
-        RESET_LINE = "\n"
+        RESET_LINE = ""
         RESET = "\033[0m"
         BOLD = "\033[1m"
         BLACK = "\033[30m"
@@ -526,6 +521,8 @@ class CsvFormatter(Formatter):
             + extra_criterions
         )
 
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+
         with open(self.filepath, "wt") as file:
             file.write(self.format_line(columns))
 
@@ -574,21 +571,28 @@ class DefaultExecutor(Executor):
     failures to reporter
     """
 
+    all_runs: Optional[int]
     finished_runs: int
     failed_runs: int
 
-    parser: ResultParser
     formatter: Formatter
+    crash_folder: Path
 
     results: list[RunResult]
 
-    def __init__(self, parser: ResultParser, formatter: Formatter) -> None:
+    def __init__(self, crash_folder: Path, formatter: Formatter) -> None:
+        self.all_runs = None
         self.finished_runs = 0
         self.failed_runs = 0
 
-        self.parser = parser
         self.formatter = formatter
+        self.crash_folder = crash_folder
+
         self.results = []
+
+    def execute_all(self, runs: list[Run]):
+        self.all_runs = len(runs)
+        return super().execute_all(runs)
 
     def execute(self, run: Run):
         cmd = shutil.which(run.command[0])
@@ -618,7 +622,10 @@ class DefaultExecutor(Executor):
 
             if proc.returncode != 0:
                 self.error_run(
-                    run, f"Program ended with non-zero return code ({proc.returncode})"
+                    run,
+                    f"Program ended with non-zero return code ({proc.returncode})",
+                    stdout=proc.stdout,
+                    stderr=proc.stderr,
                 )
                 return
 
@@ -633,22 +640,51 @@ class DefaultExecutor(Executor):
 
     def start_run(self, run: Run) -> None:
         print(
-            f"{TUI.RESET_LINE}["
-            + f"{TUI.RED}{TUI.BOLD}{self.failed_runs}{TUI.RESET}/"
-            + f"{TUI.GREEN}{TUI.BOLD}{self.finished_runs}{TUI.RESET}] "
-            + run.as_identifier(),
+            "["
+            + f"{TUI.RED}{TUI.BOLD}{self.failed_runs}{TUI.RESET}"
+            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_runs}{TUI.RESET}"
+            + (
+                f"/{TUI.BLUE}{TUI.BOLD}{self.all_runs}{TUI.RESET}"
+                if self.all_runs is not None
+                else ""
+            )
+            + "] "
+            + run.as_identifier()
+            + "\n",
             end="",
         )
 
-    def error_run(self, run: Run, msg: str):
+    def error_run(
+        self,
+        run: Run,
+        msg: str,
+        stdout: Optional[str] = None,
+        stderr: Optional[str] = None,
+    ):
         self.failed_runs += 1
-        print(
-            f"\n{TUI.RED}{TUI.BOLD}Error in {run.as_identifier()}{TUI.RESET}\n{msg}\n"
-        )
+        print(f"{TUI.RED}{TUI.BOLD}Error in {run.as_identifier()}{TUI.RESET}\n{msg}\n")
+
+        # TODO: save to folder
+
+        if stdout is not None or stderr is not None:
+            run_path = self.crash_folder / run.as_identifier().replace(" ", "_")
+            run_path.mkdir(parents=True, exist_ok=True)
+
+            if stdout is not None:
+                with open(run_path / "stdout", "wt") as file:
+                    file.write(stdout)
+
+            if stderr is not None:
+                with open(run_path / "stderr", "wt") as file:
+                    file.write(stderr)
+
+            print(
+                f"{TUI.RED}stdout and stderr are saved in {str(run_path)}{TUI.RESET}\n"
+            )
 
     def finalize(self, run: Run, stdout: str, stderr: str) -> None:
         self.finished_runs += 1
-        self.results.append(self.parser.parse(run, stdout))
+        self.results.append(run.parser.parse(run, stdout))
 
     def __enter__(self):
         return self
@@ -658,7 +694,6 @@ class DefaultExecutor(Executor):
         return False
 
 
-#
 # class ParallelExecutor(DefaultExecutor):
 #     pool: ThreadPoolExecutor
 #     lock: Lock
@@ -753,7 +788,12 @@ def parse_params(*params: str, **kwarg_params: Any) -> Parameters:
 # --------------------------------------
 
 
-def main(config: Config, *params: str, **kwarg_params: Any) -> None:
+def main(
+    config: Config,
+    *params: str,
+    formatter: Optional[Formatter] = None,
+    **kwarg_params: Any,
+) -> None:
     """
     Sane default main. config is the benchmarks configuration that will be
     executed, params is a list of required parameters from the user,
@@ -790,16 +830,17 @@ def main(config: Config, *params: str, **kwarg_params: Any) -> None:
 
     runs = config_to_runs(config, ps)
 
+    output: Path = Path(ps.__output).resolve()
+    if formatter is None:
+        formatter = CsvFormatter(output / "results.csv")
+
     if ps.__dry:
         DryExecutor().execute_all(runs)
     elif ps.__jobs > 1:
         # TODO: parallel executor
         pass
     else:
-        with DefaultExecutor(
-            LastLineParser(PlainSecondsParser()),
-            CsvFormatter(Path(ps.__output).resolve()),
-        ) as executor:
+        with DefaultExecutor(output / "crash", formatter) as executor:
             executor.execute_all(runs)
 
 

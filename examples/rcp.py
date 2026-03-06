@@ -53,9 +53,9 @@ def main():
         parallel = params.parallel
         runs = params.runs
         output = (
-            params.output
+            Path(params.output)
             if params.output is not None
-            else estack.enter_context(tempfile.TemporaryDirectory())
+            else Path(estack.enter_context(tempfile.TemporaryDirectory()))
         )
 
         bench_dir = RSH_HOME / "inst" / "benchmarks"
@@ -72,17 +72,20 @@ def main():
         ]
 
         time = shutil.which("time")
+
+        TimeSuite
+
         if time is None:
             raise ValueError("time utility is not available")
 
         RCPSuite = Suite(
             name="RCPSuite",
             benchmarks=benchmarks,
+            parser=benchr.RebenchParser(),
             working_directory=CWD,
             command=lambda _, benchmark: (
                 [time, "-v"]
-                + [str(R), "--slave", "--no-restore"]
-                + ["-f", str(harness_bin), "--args"]
+                + [str(R), "--slave", "--no-restore", "-f", str(harness_bin), "--args"]
                 + ["--output-dir", output]
                 + ["--runs", str(runs)]
                 + bench_opts
@@ -94,9 +97,17 @@ def main():
 
         check_microbenchmark(Rscript)
 
-        # TODO: Executor
-        # executor = DryExecutor()
-        with DefaultExecutor(benchr.RebenchParser(), benchr.CsvFormatter()) as executor:
+        benchr.run_cmd(
+            [
+                Rscript,
+                "-e",
+                """if (!requireNamespace("rcp", quietly=TRUE)) quit(status=1)""",
+            ]
+        )
+
+        with DefaultExecutor(
+            output / "crash", benchr.CsvFormatter(output / "result.csv")
+        ) as executor:
             executor.execute_all(runs)
 
 
