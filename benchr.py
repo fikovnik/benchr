@@ -1,21 +1,17 @@
 import abc
 import argparse
 import dataclasses
-import functools
-import inspect
 import re
 import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from itertools import zip_longest
 from pathlib import Path
 from pprint import pprint
 from threading import Lock
-from types import ClassMethodDescriptorType, SimpleNamespace
-from typing import Any, Callable, Iterator, Literal, Optional, Self
-
+from types import SimpleNamespace
+from typing import Any, Callable, Iterator, Literal, Optional, Self, Sequence
 
 # --------------------------------------
 #           HELPERS
@@ -24,6 +20,14 @@ from typing import Any, Callable, Iterator, Literal, Optional, Self
 
 def const[T](x: T) -> Callable[..., T]:
     return lambda *args, **kwargs: x
+
+
+# TODO: maybe adjust api, maybe remove
+def run_cmd(*args, **kwargs):
+    """
+    Run a very simple command, wrapper around subprocess.run
+    """
+    return subprocess.run(*args, check=True, **kwargs)
 
 
 # --------------------------------------
@@ -38,19 +42,15 @@ class Parameters(SimpleNamespace):
     def __or__(self, other: "Parameters") -> "Parameters":
         return Parameters(**vars(self), **vars(other))
 
+    @staticmethod
+    def from_namespace(ns: argparse.Namespace) -> "Parameters":
+        """
+        Convert the argparse.Namespace to Parameters
+        """
+        return Parameters(**vars(ns))
 
-# --------------------------------------
-#           HELPER
-# --------------------------------------
 
-
-# TODO: maybe adjust api, maybe remove
-def run_cmd(*args, **kwargs):
-    """
-    Run a very simple command, wrapper around subprocess.run
-    """
-    return subprocess.run(*args, check=True, **kwargs)
-
+type Factory[T] = Callable[[Parameters, Benchmark], T]
 
 # --------------------------------------
 #          INPUT DEFINITIONS
@@ -65,11 +65,12 @@ class Execution:
 
     benchmark_name: str
     suite: str
+    parser: "ResultParser"
 
     command: Command
-    parser: "ResultParser"
     working_directory: Path
     env: Env
+
     info: dict[str, str]
 
     def as_identifier(self) -> str:
@@ -86,8 +87,8 @@ class Execution:
 @dataclass
 class Benchmark:
     """
-    A definition of one benchmark. data can be any benchmark-specific data
-    that are needed for its execution.
+    A definition of one benchmark. data and keys can be any benchmark-specific
+    data that are needed for its execution.
     """
 
     name: str
@@ -120,7 +121,7 @@ class Benchmark:
         for path, _, files in folder.walk():
             for file in files:
                 p = path / file
-                if extension is None or p.suffix.lower() == "." + extension.lower():
+                if extension is None or p.suffix.lower() == ("." + extension.lower()):
                     res.append(path / file)
 
         return Benchmark.from_files(*res)
@@ -128,10 +129,7 @@ class Benchmark:
 
 B = Benchmark
 
-# TODO: Benchmarks from files
 
-
-@dataclass
 class Suite:
     """
     A collection of benchmarks. They should all be connected with similar
@@ -139,7 +137,6 @@ class Suite:
     """
 
     type SuiteFactory[T] = Callable[[Parameters, Benchmark], T]
-    type ConstructBenchList = list[Benchmark] | list[Benchmark] | list[Benchmark | str]
 
     name: str
     benchmarks: list[Benchmark] | Callable[[Parameters], list[Benchmark]]
@@ -153,7 +150,7 @@ class Suite:
     def __init__(
         self,
         name: str,
-        benchmarks: ConstructBenchList | Callable[[Parameters], list[Benchmark]],
+        benchmarks: Sequence[Benchmark | str] | Callable[[Parameters], list[Benchmark]],
         command: SuiteFactory[Command],
         parser: "ResultParser",
         working_directory: Optional[SuiteFactory[Path] | Path] = None,
@@ -360,8 +357,6 @@ class MatrixConfig[T](Config):
                 )
 
 
-C = BaseConfig
-
 # --------------------------------------
 #           RESULT DEFINITIONS
 # --------------------------------------
@@ -370,10 +365,11 @@ C = BaseConfig
 @dataclass
 class Measurement:
     execution: Execution
-    measurement_info: dict[str, str]
     metric: str
     value: float
     unit: str
+
+    measurement_info: dict[str, str]
 
     @staticmethod
     def runtime(
@@ -384,10 +380,10 @@ class Measurement:
     ) -> "Measurement":
         return Measurement(
             execution=execution,
-            measurement_info=measurement_info,
             metric="runtime",
             value=value,
             unit=unit,
+            measurement_info=measurement_info,
         )
 
 
@@ -397,7 +393,7 @@ class ExecutionResult:
 
 
 # --------------------------------------
-#           PARSER
+#           PARSERS
 # --------------------------------------
 
 
@@ -479,7 +475,13 @@ class RegexParser(ResultParser):
                     info = {}
 
                 result.measurements.append(
-                    Measurement(execution, info, self.metric, value, self.unit)
+                    Measurement(
+                        execution,
+                        self.metric,
+                        value,
+                        self.unit,
+                        info,
+                    )
                 )
 
         return result
@@ -536,7 +538,11 @@ class RebenchParser(ResultParser):
 
                 result.measurements.append(
                     Measurement(
-                        execution, {"iteration": str(iteration)}, "runtime", time, "ms"
+                        execution,
+                        "runtime",
+                        time,
+                        "ms",
+                        {"iteration": str(iteration)},
                     )
                 )
                 iteration += 1
@@ -552,7 +558,11 @@ class RebenchParser(ResultParser):
                 # Add measurement
                 result.measurements.append(
                     Measurement(
-                        execution, {"iteration": str(iteration)}, criterion, value, unit
+                        execution,
+                        criterion,
+                        value,
+                        unit,
+                        {"iteration": str(iteration)},
                     )
                 )
 
@@ -595,7 +605,7 @@ class TimeParser(ResultParser):
         self.columns = list(columns)
 
     def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
-        return super().parse(execution, stdout, stderr)
+        raise NotImplemented
 
 
 # --------------------------------------
@@ -605,9 +615,6 @@ class TimeParser(ResultParser):
 
 class TUI:
     if sys.stdout.isatty():
-        # TODO:
-        # RESET_LINE = "\r"
-        RESET_LINE = ""
         RESET = "\033[0m"
         BOLD = "\033[1m"
         BLACK = "\033[30m"
@@ -619,7 +626,6 @@ class TUI:
         CYAN = "\033[36m"
         WHITE = "\033[37m"
     else:
-        RESET_LINE = "\n"
         RESET = ""
         BOLD = ""
         BLACK = ""
@@ -633,13 +639,13 @@ class TUI:
 
 
 # --------------------------------------
-#           FORMATTERS
+#           REPORTERS
 # --------------------------------------
 
 
-class Formatter(abc.ABC):
+class Reporter(abc.ABC):
     @abc.abstractmethod
-    def format(self, results: list[ExecutionResult]): ...
+    def report(self, results: list[ExecutionResult]): ...
 
     @staticmethod
     def metrics(results: list[ExecutionResult]) -> list[str]:
@@ -677,7 +683,7 @@ class Formatter(abc.ABC):
         return out
 
 
-class CsvFormatter(Formatter):
+class CsvReporter(Reporter):
     filepath: Path
     separator: str
 
@@ -695,73 +701,9 @@ class CsvFormatter(Formatter):
     def format_line(self, line: list[str]) -> str:
         return self.separator.join(map(self.escape_text, line)) + "\n"
 
-    def format(self, results: list[ExecutionResult]):
-        info_cols = Formatter.info_columns(results)
-        measurement_info_cols = Formatter.measurement_info_columns(results)
-        metrics = Formatter.metrics(results)
-
-        columns = (
-            ["benchmark", "suite"]
-            + info_cols
-            + measurement_info_cols
-            + metrics
-            + ["unit"]
-        )
-
-        self.filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(self.filepath, "wt") as file:
-            file.write(self.format_line(columns))
-
-            for result in results:
-                for measure in result.measurements:
-                    line: list[str] = [
-                        measure.execution.benchmark_name,
-                        measure.execution.suite,
-                    ]
-
-                    for col in info_cols:
-                        line.append(measure.execution.info.get(col, ""))
-
-                    for col in measurement_info_cols:
-                        line.append(measure.measurement_info.get(col, ""))
-
-                    for metric in metrics:
-                        if measure.metric == metric:
-                            line.append(str(measure.value))
-                        else:
-                            line.append("")
-
-                    line.append(measure.unit)
-
-                    file.write(self.format_line(line))
-
-
-class FlatCsvFormatter(Formatter):
-    filepath: Path
-    separator: str
-
-    def __init__(self, filepath: Path, separator: str = ",") -> None:
-        self.filepath = filepath
-        self.separator = separator
-
-    @staticmethod
-    def escape_text(text: str) -> str:
-        if "," in text:
-            return '"' + text.replace('"', r"\"") + '"'
-
-        return text
-
-    def format_line(self, line: list[str]) -> str:
-        pprint(line)
-        return self.separator.join(map(self.escape_text, line)) + "\n"
-
-    def format(self, results: list[ExecutionResult]):
-        info_cols = Formatter.info_columns(results)
-        measurement_info_cols = Formatter.measurement_info_columns(results)
-
-        pprint(info_cols)
-        pprint(measurement_info_cols)
+    def report(self, results: list[ExecutionResult]):
+        info_cols = Reporter.info_columns(results)
+        measurement_info_cols = Reporter.measurement_info_columns(results)
 
         columns = (
             ["benchmark", "suite"]
@@ -817,17 +759,17 @@ class DefaultExecutor(Executor):
     finished_executions: int
     failed_executions: int
 
-    formatter: Formatter
+    reporter: Reporter
     crash_folder: Path
 
     results: list[ExecutionResult]
 
-    def __init__(self, crash_folder: Path, formatter: Formatter) -> None:
+    def __init__(self, crash_folder: Path, reporter: Reporter) -> None:
         self.all_executions = None
         self.finished_executions = 0
         self.failed_executions = 0
 
-        self.formatter = formatter
+        self.reporter = reporter
         self.crash_folder = crash_folder
 
         self.results = []
@@ -936,7 +878,7 @@ class DefaultExecutor(Executor):
         return self
 
     def __exit__(self, *args):
-        self.formatter.format(self.results)
+        self.reporter.report(self.results)
         return False
 
 
@@ -1013,32 +955,24 @@ def make_argparser(*params: str, **kwarg_params: Any) -> argparse.ArgumentParser
     return parser
 
 
-def namespace_to_parameters(ns: argparse.Namespace) -> Parameters:
-    """
-    Convert the argparse.Namespace to Parameters
-    """
-    return Parameters(**vars(ns))
-
-
 def parse_params(*params: str, **kwarg_params: Any) -> Parameters:
     """
     Create a default argument parser and run it on argv
     """
     parser = make_argparser(*params, **kwarg_params)
     args = parser.parse_args()
-    return namespace_to_parameters(args)
+    return Parameters.from_namespace(args)
 
 
 # --------------------------------------
-#          DEFAULT RUN
+#          DEFAULT MAIN
 # --------------------------------------
 
 
 def main(
     config: Config,
     *params: str,
-    formatter: Optional[Formatter] = None,
-    derived: Optional[Callable[[Parameters], Parameters]] = None,
+    reporter: Optional[Reporter] = None,
     **kwarg_params: Any,
 ) -> None:
     """
@@ -1073,15 +1007,13 @@ def main(
         dest="__dry",
     )
 
-    ps = namespace_to_parameters(parser.parse_args())
-    if derived is not None:
-        ps |= derived(ps)
+    ps = Parameters.from_namespace(parser.parse_args())
 
     executions = list(config.to_executions(ps))
 
     output: Path = Path(ps.__output).resolve()
-    if formatter is None:
-        formatter = FlatCsvFormatter(output / "results.csv")
+    if reporter is None:
+        reporter = CsvReporter(output / "results.csv")
 
     if ps.__dry:
         DryExecutor().execute_all(executions)
@@ -1089,9 +1021,56 @@ def main(
         # TODO: parallel executor
         pass
     else:
-        with DefaultExecutor(output / "crash", formatter) as executor:
+        with DefaultExecutor(output / "crash", reporter) as executor:
             executor.execute_all(executions)
 
 
 # TODO: Catch keyboard_interrupts
 # TODO: Run info - date, reflog
+
+# --------------------------------------
+#           EXPORTS
+# --------------------------------------
+
+__all__ = [
+    # Helpers
+    "run_cmd",
+    # Definitions
+    "Env",
+    "Command",
+    "Parameters",
+    # Input definitions
+    "Execution",
+    "Benchmark",
+    "B",
+    "Suite",
+    # Configuration
+    "Config",
+    "config",
+    "MatrixConfig",
+    # Result definitions
+    "Measurement",
+    "ExecutionResult",
+    # Parsers
+    "ResultParser",
+    "PlainSecondsParser",
+    "LastLineParser",
+    "RegexParser",
+    "RebenchParser",
+    "MixedResultParser",
+    "TimeParser",
+    # Reporters
+    "Reporter",
+    "CsvReporter",
+    # Executors
+    "Executor",
+    "DefaultExecutor",
+    "DryExecutor",
+    # ArgumentParsing
+    "make_argparser",
+    "parse_params",
+    # Default main
+    "main",
+    # Reexports
+    "Path",
+]

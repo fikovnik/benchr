@@ -59,19 +59,15 @@ def main():
         R = R_HOME / "bin" / "R"
         Rscript = R_HOME / "bin" / "Rscript"
 
-        # benchmarks = [
-        #     Benchmark(path.stem, path)
-        #     for path in bench_dir.rglob(f"*{path_filter}*.R")
-        #     # Top level has main program and harness -> we want benchmarks
-        #     if path.parent != bench_dir
-        # ]
-
-        benchmarks = [
-            b
-            for b in Benchmark.from_folder(bench_dir, extension="R")
-            if b.keys.path.parent != bench_dir
-            and (path_filter == "" or path_filter not in str(b.keys.path))
-        ]
+        benchmarks = list(
+            filter(
+                lambda b: (
+                    b.keys.path.parent != bench_dir
+                    and (path_filter == "" or path_filter not in str(b.keys.path))
+                ),
+                Benchmark.from_folder(bench_dir, extension="R"),
+            )
+        )
 
         RCPSuite = (
             benchr.config(
