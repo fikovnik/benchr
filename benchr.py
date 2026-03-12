@@ -11,7 +11,7 @@ from pathlib import Path
 from pprint import pprint
 from threading import Lock
 from types import SimpleNamespace
-from typing import Any, Callable, Iterator, Literal, Optional, Self, Sequence
+from typing import Any, Callable, Iterator, Literal, Optional, Sequence
 
 # --------------------------------------
 #           HELPERS
@@ -49,8 +49,6 @@ class Parameters(SimpleNamespace):
         """
         return Parameters(**vars(ns))
 
-
-type Factory[T] = Callable[[Parameters, Benchmark], T]
 
 # --------------------------------------
 #          INPUT DEFINITIONS
@@ -129,64 +127,121 @@ class Benchmark:
 
 B = Benchmark
 
+# --------------------------------------
+#          SUITES OF BENCHMARKS
+# --------------------------------------
 
-class Suite:
+
+class Suite(abc.ABC):
     """
     A collection of benchmarks. They should all be connected with similar
     structure.
     """
 
-    type SuiteFactory[T] = Callable[[Parameters, Benchmark], T]
+    @abc.abstractmethod
+    def get_executions(
+        self,
+        parameters: Parameters,
+        default_working_directory: Optional[
+            Callable[[Parameters, Benchmark, str], Path]
+        ],
+        default_env: Callable[[Parameters, Benchmark, str], Env],
+    ) -> Iterator[Execution]: ...
 
+    def to_config(self) -> "Config":
+        return Config(self)
+
+
+class BaseSuite(Suite):
     name: str
-    benchmarks: list[Benchmark] | Callable[[Parameters], list[Benchmark]]
+    benchmarks: Callable[[Parameters], list[Benchmark]]
 
-    command: SuiteFactory[Command]
+    command: Callable[[Parameters, Benchmark], Command]
+    working_directory: Optional[Callable[[Parameters, Benchmark], Path]]
+    env: Callable[[Parameters, Benchmark], Env]
+
     parser: "ResultParser"
-
-    working_directory: Optional[SuiteFactory[Path] | Path]
-    env: SuiteFactory[Env]
 
     def __init__(
         self,
         name: str,
-        benchmarks: Sequence[Benchmark | str] | Callable[[Parameters], list[Benchmark]],
-        command: SuiteFactory[Command],
+        benchmarks: Callable[[Parameters], list[Benchmark]],
+        command: Callable[[Parameters, Benchmark], Command],
+        working_directory: Optional[Callable[[Parameters, Benchmark], Path]],
+        env: Callable[[Parameters, Benchmark], Env],
         parser: "ResultParser",
-        working_directory: Optional[SuiteFactory[Path] | Path] = None,
-        env: SuiteFactory[Env] | Env = {},
     ) -> None:
         self.name = name
-        if callable(benchmarks):
-            self.benchmarks = benchmarks
-        else:
-            self.benchmarks = [
-                Benchmark(b) if isinstance(b, str) else b for b in benchmarks
-            ]
+        self.benchmarks = benchmarks
 
         self.command = command
+        self.working_directory = working_directory
+        self.env = env
+
         self.parser = parser
 
-        self.working_directory = working_directory
+    def get_executions(
+        self, parameters, default_working_directory, default_env
+    ) -> Iterator[Execution]:
+        benchs = self.benchmarks(parameters)
 
-        if callable(env):
-            self.env = env
-        else:
-            self.env = const(env)
-
-    def get_benchmarks(self, parameters: Parameters) -> list[Benchmark]:
-        if callable(self.benchmarks):
-            bs = self.benchmarks(parameters)
-        else:
-            bs = self.benchmarks
-
-        if len(bs) == 0:
+        if len(benchs) == 0:
             raise ValueError(f"No benchmarks defined in {self.name}!")
 
-        return bs
+        for b in benchs:
+            command = self.command(parameters, b)
 
-    def mk_command(self, parameters: Parameters, benchmark: Benchmark) -> Command:
-        return self.command(parameters, benchmark)
+            if self.working_directory is not None:
+                working_directory = self.working_directory(parameters, b)
+            elif default_working_directory is not None:
+                working_directory = default_working_directory(parameters, b, self.name)
+            else:
+                raise ValueError(f"No working directory defined for suite {self.name}")
+
+            env = default_env(parameters, b, self.name) | self.env(parameters, b)
+
+            yield Execution(
+                benchmark_name=b.name,
+                suite=self.name,
+                command=command,
+                parser=self.parser,
+                working_directory=working_directory,
+                env=env,
+                info={},
+            )
+
+
+def suite(
+    name: str,
+    benchmarks: Sequence[Benchmark | str] | Callable[[Parameters], list[Benchmark]],
+    *,
+    command: Callable[[Parameters, Benchmark], Command],
+    working_directory: Optional[Callable[[Parameters, Benchmark], Path] | Path] = None,
+    env: Callable[[Parameters, Benchmark], Env] | Env = {},
+    parser: "ResultParser",
+) -> Suite:
+    """
+    Flexible way of constructing a Suite
+    """
+    if not callable(benchmarks):
+        benchmarks = const(
+            [Benchmark(b) if isinstance(b, str) else b for b in benchmarks]
+        )
+
+    if working_directory is not None and not callable(working_directory):
+        working_directory = const(working_directory)
+
+    if not callable(env):
+        env = const(env)
+
+    return BaseSuite(
+        name=name,
+        benchmarks=benchmarks,
+        command=command,
+        working_directory=working_directory,
+        env=env,
+        parser=parser,
+    )
 
 
 # --------------------------------------
@@ -194,167 +249,35 @@ class Suite:
 # --------------------------------------
 
 
-type ConfigFactory[T] = Callable[[Parameters, Suite, Benchmark], T]
-type MatrixFactory[T, U] = Callable[[T, U], U]
-
-
-default_info = const({})
-
-
-class Config(abc.ABC):
-    @abc.abstractmethod
-    def to_executions(self, parameters: Parameters) -> Iterator[Execution]: ...
-
-    def matrix[T](
-        self,
-        name: str,
-        *params: T,
-        working_directory: Optional[MatrixFactory[T, Path]] = None,
-        env: Optional[MatrixFactory[T, Env] | str | Literal[True]] = None,
-    ) -> "MatrixConfig[T]":
-        return MatrixConfig(
-            self,
-            name,
-            *params,
-            working_directory=working_directory,
-            env=env,
-        )
-
-    def runs(self, value: int) -> "Config":
-        return self.matrix("run", *[i for i in range(1, value + 1)])
-
-    def time(self, *args: str) -> "Config":
-        time = shutil.which("time")
-
-        if time is None:
-            raise ValueError("time utility is not available")
-        # TODO:
-        return self
-
-
-def config(
-    *suites: Suite,
-    working_directory: Optional[ConfigFactory[Path] | Path] = None,
-    env: ConfigFactory[Env] | Env = {},
-    info: ConfigFactory[dict[str, str]] = default_info,
-) -> Config:
-    return BaseConfig(*suites, working_directory=working_directory, env=env, info=info)
-
-
-class BaseConfig(Config):
+# TODO: matrix, runs, time
+class Config:
     """
     The full configuration of all suites.
     """
 
     suites: list[Suite]
 
-    working_directory: Optional[ConfigFactory[Path] | Path]
-    env: ConfigFactory[Env]
-
-    info: ConfigFactory[dict[str, str]]
+    default_working_directory: Optional[Callable[[Parameters, Suite, Benchmark], Path]]
+    default_env: Callable[[Parameters, Suite, Benchmark], Env]
 
     def __init__(
         self,
         *suites: Suite,
-        working_directory: Optional[ConfigFactory[Path] | Path] = None,
-        env: ConfigFactory[Env] | Env = {},
-        info: ConfigFactory[dict[str, str]] = default_info,
     ) -> None:
-        if len(suites) == 0:
-            raise ValueError("No suites defined!")
-
         self.suites = list(suites)
-        self.working_directory = working_directory
+        self.default_working_directory = None
+        self.default_env = const({})
 
-        if callable(env):
-            self.env = env
-        else:
-            self.env = const(env)
-
-        self.info = info
-
-    def to_executions(self, parameters: Parameters) -> Iterator[Execution]:
-        for suite in self.suites:
-            for bench in suite.get_benchmarks(parameters):
-                command = suite.mk_command(parameters, bench)
-
-                # WD
-                if suite.working_directory is not None:
-                    if callable(suite.working_directory):
-                        wd = suite.working_directory(parameters, bench)
-                    else:
-                        wd = suite.working_directory
-
-                elif self.working_directory is not None:
-                    if callable(self.working_directory):
-                        wd = self.working_directory(parameters, suite, bench)
-                    else:
-                        wd = self.working_directory
-                else:
-                    raise ValueError(
-                        f"No working directory defined for suite {suite.name}"
-                    )
-
-                env = suite.env(parameters, bench) | self.env(parameters, suite, bench)
-
-                info = self.info(parameters, suite, bench)
-
-                yield Execution(
-                    benchmark_name=bench.name,
-                    suite=suite.name,
-                    command=command,
-                    parser=suite.parser,
-                    working_directory=wd,
-                    env=env,
-                    info=info,
-                )
-
-
-class MatrixConfig[T](Config):
-    parent: Config
-    name: str
-    parameters: list[T]
-
-    working_directory: MatrixFactory[T, Path]
-    env: MatrixFactory[T, Env]
-
-    def __init__(
-        self,
-        parent: Config,
-        name: str,
-        *params: T,
-        working_directory: Optional[MatrixFactory[T, Path]] = None,
-        env: Optional[MatrixFactory[T, Env] | str | Literal[True]] = None,
-    ) -> None:
-        self.parent = parent
-        self.name = name
-        self.parameters = list(params)
-
-        if working_directory is None:
-            self.working_directory = lambda _, path: path
-        else:
-            self.working_directory = working_directory
-
-        if env is None:
-            self.env = lambda _, prev_env: prev_env
-        elif env is True:
-            self.env = lambda param, prev_env: prev_env | {name: str(param)}
-        elif isinstance(env, str):
-            self.env = lambda param, prev_env: prev_env | {str(env): str(param)}
-        else:
-            self.env = env
-
-    def to_executions(self, parameters: Parameters) -> Iterator[Execution]:
-        for exe in self.parent.to_executions(parameters):
-            for param in self.parameters:
-                yield dataclasses.replace(
-                    exe,
-                    working_directory=self.working_directory(
-                        param, exe.working_directory
-                    ),
-                    env=self.env(param, exe.env),
-                    info=exe.info | {self.name: str(param)},
-                )
+    def get_executions(self, parameters: Parameters) -> list[Execution]:
+        return [
+            exe
+            for suite in self.suites
+            for exe in suite.get_executions(
+                parameters,
+                self.default_working_directory,
+                self.default_env,
+            )
+        ]
 
 
 # --------------------------------------
@@ -435,7 +358,7 @@ class LastLineParser(ResultParser):
             if stderr_line.strip() != "":
                 break
 
-        return self.subparser.parse(execution, stdout_line, stderr)
+        return self.subparser.parse(execution, stdout_line, stderr_line)
 
 
 class RegexParser(ResultParser):
@@ -605,6 +528,7 @@ class TimeParser(ResultParser):
         self.columns = list(columns)
 
     def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        # TODO:
         raise NotImplemented
 
 
@@ -1009,7 +933,7 @@ def main(
 
     ps = Parameters.from_namespace(parser.parse_args())
 
-    executions = list(config.to_executions(ps))
+    executions = list(config.get_executions(ps))
 
     output: Path = Path(ps.__output).resolve()
     if reporter is None:
@@ -1043,11 +967,11 @@ __all__ = [
     "Execution",
     "Benchmark",
     "B",
+    # Suites of benchmarks
     "Suite",
+    "suite",
     # Configuration
     "Config",
-    "config",
-    "MatrixConfig",
     # Result definitions
     "Measurement",
     "ExecutionResult",
