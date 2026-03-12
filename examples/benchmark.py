@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import benchr
-from benchr import B, Config, Suite
+from benchr import B, RebenchParser, config, Suite
 
 INPUTS = Path(__file__).resolve() / "inputs"
 BENCHMARKS = INPUTS / "Benchmarks"
@@ -31,30 +31,29 @@ DEFAULT_ENV = LOCALE | {
 }
 
 
-class AreWeFast(Suite):
-    name = "areWeFast"
-    working_directory = BENCHMARKS / "areWeFast"
-    benchmarks = [
+AreWeFast = Suite(
+    name="areWeFast",
+    working_directory=BENCHMARKS / "areWeFast",
+    benchmarks=[
         B("Mandelbrot", 500),
         B("Bounce", 35),
         B("Bounce_nonames", 35),
         B("Bounce_nonames_simple", 35),
         B("Storage", 100),
-    ]
+    ],
+    parser=RebenchParser(),
+    command=lambda parameters, benchmark: [
+        str(Path(parameters.Rpath) / "bin" / "Rscript"),
+        "harness.r",
+        benchmark.name,
+        str(parameters.iterations),
+        str(benchmark.data),
+    ],
+)
 
-    def mk_command(self, parameters, benchmark):
-        return [
-            str(Path(parameters.Rpath) / "bin" / "Rscript"),
-            "harness.r",
-            benchmark.name,
-            str(parameters.iterations),
-            str(benchmark.data[0]),
-        ]
-
-
-class Shootout(Suite):
-    name = "shootout"
-    benchmarks = [
+Shootout = Suite(
+    name="shootout",
+    benchmarks=[
         B("binarytrees", "binarytrees", 9),
         B("fannkuchredux", "fannkuch", 9),
         B("fasta", "fasta", 60000),
@@ -69,81 +68,79 @@ class Shootout(Suite):
         B("reversecomplement", "reversecomplement", 150000),
         B("spectralnorm", "spectralnorm", 1200),
         B("spectralnorm_math", "spectralnorm", 1200),
-    ]
+    ],
+    parser=RebenchParser(),
+    working_directory=lambda parameters, benchmark: (
+        BENCHMARKS / "shootout" / benchmark.data[0]
+    ),
+    command=lambda parameters, benchmark: [
+        str(Path(parameters.Rpath) / "bin" / "Rscript"),
+        "harness.r",
+        benchmark.name,
+        str(parameters.iterations),
+        str(benchmark.data[1]),
+    ],
+)
 
-    def mk_working_directory(self, parameters, benchmark):
-        return BENCHMARKS / "shootout" / benchmark.data[0]
 
-    def mk_command(self, parameters, benchmark):
-        return [
-            str(Path(parameters.Rpath) / "bin" / "Rscript"),
-            "harness.r",
-            benchmark.name,
-            str(parameters.iterations),
-            str(benchmark.data[1]),
-        ]
-
-
-class RealThing(Suite):
-    name = "RealThing"
-    working_directory = BENCHMARKS / "RealThing"
-    benchmarks = [
+RealThing = Suite(
+    name="RealThing",
+    working_directory=BENCHMARKS / "RealThing",
+    benchmarks=[
         B("convolution", 500),
         B("convolution_slow", 1500),
         B("volcano", 1),
         B("flexclust", 5),
-    ]
-
-    def mk_command(self, parameters, benchmark):
-        return [
-            str(Path(parameters.Rpath) / "bin" / "Rscript"),
-            "harness.r",
-            benchmark.name,
-            str(parameters.iterations),
-            str(benchmark.data[0]),
-        ]
-
-
-class Kaggles(Suite):
-    name = "kaggle"
-    benchmarks = [
-        B("basic-analysis"),
-        B("bolt-driver"),
-        B("london-airbnb"),
-        B("placement"),
-        B("titanic"),
-    ]
-
-    def mk_working_directory(self, parameters, benchmark):
-        return INPUTS / "kaggle" / benchmark.name
-
-    def mk_command(self, parameters, benchmark):
-        return [
-            str(Path(parameters.Rpath) / "bin" / "Rscript"),
-            "../../harness.r",
-            benchmark.name,
-            str(parameters.iterations),
-        ]
+    ],
+    parser=RebenchParser(),
+    command=lambda parameters, benchmark: [
+        str(Path(parameters.Rpath) / "bin" / "Rscript"),
+        "harness.r",
+        benchmark.name,
+        str(parameters.iterations),
+        str(benchmark.data),
+    ],
+)
 
 
-class Recommenderlab(Suite):
-    name = "recommenderlab"
-    benchmarks = [B("recommenderlab")]
-    working_directory = INPUTS / "recommenderlab"
+Kaggles = Suite(
+    name="kaggle",
+    benchmarks=[
+        "basic-analysis",
+        "bolt-driver",
+        "london-airbnb",
+        "placement",
+        "titanic",
+    ],
+    parser=RebenchParser(),
+    working_directory=lambda parameters, benchmark: INPUTS / "kaggle" / benchmark.name,
+    command=lambda parameters, benchmark: [
+        str(Path(parameters.Rpath) / "bin" / "Rscript"),
+        "../../harness.r",
+        benchmark.name,
+        str(parameters.iterations),
+    ],
+)
 
-    def mk_command(self, parameters, benchmark):
-        return [
-            str(Path(parameters.Rpath) / "bin" / "Rscript"),
-            "runner.r",
-        ]
+
+Recommenderlab = Suite(
+    name="recommenderlab",
+    benchmarks=["recommenderlab"],
+    working_directory=INPUTS / "recommenderlab",
+    parser=RebenchParser(),
+    command=lambda parameters, benchmark: [
+        str(Path(parameters.Rpath) / "bin" / "Rscript"),
+        "runner.r",
+    ],
+)
 
 
-conf = Config(
-    AreWeFast(),
-    Shootout(),
-    RealThing(),
-    Kaggles(),
-    Recommenderlab(),
+conf = config(
+    AreWeFast,
+    Shootout,
+    RealThing,
+    Kaggles,
+    Recommenderlab,
     env=DEFAULT_ENV,
 )
 

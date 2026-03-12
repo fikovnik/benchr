@@ -1,6 +1,8 @@
 import abc
 import argparse
 import dataclasses
+import functools
+import inspect
 import re
 import shutil
 import subprocess
@@ -11,8 +13,18 @@ from itertools import zip_longest
 from pathlib import Path
 from pprint import pprint
 from threading import Lock
-from types import SimpleNamespace
-from typing import Any, Callable, Optional
+from types import ClassMethodDescriptorType, SimpleNamespace
+from typing import Any, Callable, Iterator, Literal, Optional, Self
+
+
+# --------------------------------------
+#           HELPERS
+# --------------------------------------
+
+
+def const[T](x: T) -> Callable[..., T]:
+    return lambda *args, **kwargs: x
+
 
 # --------------------------------------
 #           DEFINITIONS
@@ -46,7 +58,11 @@ def run_cmd(*args, **kwargs):
 
 
 @dataclass
-class Run:
+class Execution:
+    """
+    A definition of ready-to-run command
+    """
+
     benchmark_name: str
     suite: str
 
@@ -76,8 +92,9 @@ class Benchmark:
 
     name: str
     data: tuple[Any, ...] | Any
+    keys: SimpleNamespace
 
-    def __init__(self, name: str, *data: Any) -> None:
+    def __init__(self, name: str, *data: Any, **keys: Any) -> None:
         self.name = name
 
         if len(data) == 1:
@@ -85,11 +102,35 @@ class Benchmark:
         else:
             self.data = data
 
+        self.keys = SimpleNamespace(keys)
+
+    @staticmethod
+    def from_files(*files: Path) -> list["Benchmark"]:
+        return [
+            Benchmark(
+                file.stem,
+                path=file,
+            )
+            for file in files
+        ]
+
+    @staticmethod
+    def from_folder(folder: Path, extension: Optional[str] = None) -> list["Benchmark"]:
+        res = []
+        for path, _, files in folder.walk():
+            for file in files:
+                p = path / file
+                if extension is None or p.suffix.lower() == "." + extension.lower():
+                    res.append(path / file)
+
+        return Benchmark.from_files(*res)
+
 
 B = Benchmark
 
+# TODO: Benchmarks from files
 
-# TODO: Maybe allow benchmark to be only string
+
 @dataclass
 class Suite:
     """
@@ -98,40 +139,120 @@ class Suite:
     """
 
     type SuiteFactory[T] = Callable[[Parameters, Benchmark], T]
+    type ConstructBenchList = list[Benchmark] | list[Benchmark] | list[Benchmark | str]
 
     name: str
-    benchmarks: list[Benchmark]
+    benchmarks: list[Benchmark] | Callable[[Parameters], list[Benchmark]]
 
     command: SuiteFactory[Command]
     parser: "ResultParser"
 
-    working_directory: Optional[SuiteFactory[Path] | Path] = None
-    env: SuiteFactory[Env] | Env = dataclasses.field(default_factory=dict)
+    working_directory: Optional[SuiteFactory[Path] | Path]
+    env: SuiteFactory[Env]
 
-    def __post_init__(self):
-        if len(self.benchmarks) == 0:
+    def __init__(
+        self,
+        name: str,
+        benchmarks: ConstructBenchList | Callable[[Parameters], list[Benchmark]],
+        command: SuiteFactory[Command],
+        parser: "ResultParser",
+        working_directory: Optional[SuiteFactory[Path] | Path] = None,
+        env: SuiteFactory[Env] | Env = {},
+    ) -> None:
+        self.name = name
+        if callable(benchmarks):
+            self.benchmarks = benchmarks
+        else:
+            self.benchmarks = [
+                Benchmark(b) if isinstance(b, str) else b for b in benchmarks
+            ]
+
+        self.command = command
+        self.parser = parser
+
+        self.working_directory = working_directory
+
+        if callable(env):
+            self.env = env
+        else:
+            self.env = const(env)
+
+    def get_benchmarks(self, parameters: Parameters) -> list[Benchmark]:
+        if callable(self.benchmarks):
+            bs = self.benchmarks(parameters)
+        else:
+            bs = self.benchmarks
+
+        if len(bs) == 0:
             raise ValueError(f"No benchmarks defined in {self.name}!")
+
+        return bs
 
     def mk_command(self, parameters: Parameters, benchmark: Benchmark) -> Command:
         return self.command(parameters, benchmark)
 
 
-def default_info(p: Parameters, s: Suite, b: Benchmark) -> dict[str, str]:
-    return {}
+# --------------------------------------
+#          CONFIGURATION
+# --------------------------------------
 
 
-@dataclass
-class Config:
+type ConfigFactory[T] = Callable[[Parameters, Suite, Benchmark], T]
+type MatrixFactory[T, U] = Callable[[T, U], U]
+
+
+default_info = const({})
+
+
+class Config(abc.ABC):
+    @abc.abstractmethod
+    def to_executions(self, parameters: Parameters) -> Iterator[Execution]: ...
+
+    def matrix[T](
+        self,
+        name: str,
+        *params: T,
+        working_directory: Optional[MatrixFactory[T, Path]] = None,
+        env: Optional[MatrixFactory[T, Env] | str | Literal[True]] = None,
+    ) -> "MatrixConfig[T]":
+        return MatrixConfig(
+            self,
+            name,
+            *params,
+            working_directory=working_directory,
+            env=env,
+        )
+
+    def runs(self, value: int) -> "Config":
+        return self.matrix("run", *[i for i in range(1, value + 1)])
+
+    def time(self, *args: str) -> "Config":
+        time = shutil.which("time")
+
+        if time is None:
+            raise ValueError("time utility is not available")
+        # TODO:
+        return self
+
+
+def config(
+    *suites: Suite,
+    working_directory: Optional[ConfigFactory[Path] | Path] = None,
+    env: ConfigFactory[Env] | Env = {},
+    info: ConfigFactory[dict[str, str]] = default_info,
+) -> Config:
+    return BaseConfig(*suites, working_directory=working_directory, env=env, info=info)
+
+
+class BaseConfig(Config):
     """
     The full configuration of all suites.
     """
 
-    type ConfigFactory[T] = Callable[[Parameters, Suite, Benchmark], T]
-
     suites: list[Suite]
 
     working_directory: Optional[ConfigFactory[Path] | Path]
-    env: ConfigFactory[Env] | Env
+    env: ConfigFactory[Env]
 
     info: ConfigFactory[dict[str, str]]
 
@@ -147,47 +268,41 @@ class Config:
 
         self.suites = list(suites)
         self.working_directory = working_directory
-        self.env = env
+
+        if callable(env):
+            self.env = env
+        else:
+            self.env = const(env)
+
         self.info = info
 
+    def to_executions(self, parameters: Parameters) -> Iterator[Execution]:
+        for suite in self.suites:
+            for bench in suite.get_benchmarks(parameters):
+                command = suite.mk_command(parameters, bench)
 
-def config_to_runs(config: Config, parameters: Parameters) -> list[Run]:
-    results = []
+                # WD
+                if suite.working_directory is not None:
+                    if callable(suite.working_directory):
+                        wd = suite.working_directory(parameters, bench)
+                    else:
+                        wd = suite.working_directory
 
-    for suite in config.suites:
-        for bench in suite.benchmarks:
-            command = suite.mk_command(parameters, bench)
-
-            # WD
-            if suite.working_directory is not None:
-                if callable(suite.working_directory):
-                    wd = suite.working_directory(parameters, bench)
+                elif self.working_directory is not None:
+                    if callable(self.working_directory):
+                        wd = self.working_directory(parameters, suite, bench)
+                    else:
+                        wd = self.working_directory
                 else:
-                    wd = suite.working_directory
+                    raise ValueError(
+                        f"No working directory defined for suite {suite.name}"
+                    )
 
-            elif config.working_directory is not None:
-                if callable(config.working_directory):
-                    wd = config.working_directory(parameters, suite, bench)
-                else:
-                    wd = config.working_directory
-            else:
-                raise ValueError(f"No working directory defined for suite {suite.name}")
+                env = suite.env(parameters, bench) | self.env(parameters, suite, bench)
 
-            # Env
-            if callable(suite.env):
-                env = suite.env(parameters, bench)
-            else:
-                env = suite.env
+                info = self.info(parameters, suite, bench)
 
-            if callable(config.env):
-                env |= config.env(parameters, suite, bench)
-            else:
-                env |= config.env
-
-            info = config.info(parameters, suite, bench)
-
-            results.append(
-                Run(
+                yield Execution(
                     benchmark_name=bench.name,
                     suite=suite.name,
                     command=command,
@@ -196,10 +311,56 @@ def config_to_runs(config: Config, parameters: Parameters) -> list[Run]:
                     env=env,
                     info=info,
                 )
-            )
 
-    return results
 
+class MatrixConfig[T](Config):
+    parent: Config
+    name: str
+    parameters: list[T]
+
+    working_directory: MatrixFactory[T, Path]
+    env: MatrixFactory[T, Env]
+
+    def __init__(
+        self,
+        parent: Config,
+        name: str,
+        *params: T,
+        working_directory: Optional[MatrixFactory[T, Path]] = None,
+        env: Optional[MatrixFactory[T, Env] | str | Literal[True]] = None,
+    ) -> None:
+        self.parent = parent
+        self.name = name
+        self.parameters = list(params)
+
+        if working_directory is None:
+            self.working_directory = lambda _, path: path
+        else:
+            self.working_directory = working_directory
+
+        if env is None:
+            self.env = lambda _, prev_env: prev_env
+        elif env is True:
+            self.env = lambda param, prev_env: prev_env | {name: str(param)}
+        elif isinstance(env, str):
+            self.env = lambda param, prev_env: prev_env | {str(env): str(param)}
+        else:
+            self.env = env
+
+    def to_executions(self, parameters: Parameters) -> Iterator[Execution]:
+        for exe in self.parent.to_executions(parameters):
+            for param in self.parameters:
+                yield dataclasses.replace(
+                    exe,
+                    working_directory=self.working_directory(
+                        param, exe.working_directory
+                    ),
+                    env=self.env(param, exe.env),
+                    info=exe.info | {self.name: str(param)},
+                )
+
+
+C = BaseConfig
 
 # --------------------------------------
 #           RESULT DEFINITIONS
@@ -208,58 +369,31 @@ def config_to_runs(config: Config, parameters: Parameters) -> list[Run]:
 
 @dataclass
 class Measurement:
+    execution: Execution
+    measurement_info: dict[str, str]
+    metric: str
     value: float
     unit: str
 
-
-@dataclass
-class Iteration:
-    runtime: Optional[float] = None
-    criterions: dict[str, list[Measurement]] = dataclasses.field(default_factory=dict)
-
-    def add_criterion(self, criterion: str, measurement: Measurement):
-        if criterion not in self.criterions:
-            self.criterions[criterion] = [measurement]
-        else:
-            self.criterions[criterion].append(measurement)
-
-    def __or__(self, other: "Iteration") -> "Iteration":
-        result = Iteration(
-            runtime=self.runtime if self.runtime is not None else other.runtime,
-            criterions={k: v for k, v in self.criterions.items()},
+    @staticmethod
+    def runtime(
+        execution: Execution,
+        value: float,
+        unit: str,
+        measurement_info: dict[str, str] = {},
+    ) -> "Measurement":
+        return Measurement(
+            execution=execution,
+            measurement_info=measurement_info,
+            metric="runtime",
+            value=value,
+            unit=unit,
         )
-
-        for k, v in other.criterions.items():
-            if k in result.criterions:
-                result.criterions[k].extend(v)
-            else:
-                result.criterions[k] = v
-
-        return result
 
 
 @dataclass
-class RunResult:
-    run: Run
-    iterations: list[Iteration] = dataclasses.field(default_factory=list)
-
-    def new_iteration(self, *args, **kwargs) -> Iteration:
-        it = Iteration(*args, **kwargs)
-        self.iterations.append(it)
-        return it
-
-    def __or__(self, other: "RunResult") -> "RunResult":
-        assert self.run == other.run
-
-        return RunResult(
-            run=self.run,
-            iterations=[
-                x | y
-                for x, y in zip_longest(
-                    self.iterations, other.iterations, fillvalue=Iteration()
-                )
-            ],
-        )
+class ExecutionResult:
+    measurements: list[Measurement] = dataclasses.field(default_factory=list)
 
 
 # --------------------------------------
@@ -269,17 +403,19 @@ class RunResult:
 
 class ResultParser(abc.ABC):
     @abc.abstractmethod
-    def parse(self, run: Run, stdout: str) -> RunResult: ...
+    def parse(
+        self, execution: Execution, stdout: str, stderr: str
+    ) -> ExecutionResult: ...
 
 
 class PlainSecondsParser(ResultParser):
-    def parse(self, run: Run, stdout: str) -> RunResult:
-        result = RunResult(run)
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        result = ExecutionResult()
 
         for line in stdout.split("\n"):
             try:
                 time = float(line) * 1000
-                result.new_iteration(runtime=time)
+                result.measurements.append(Measurement.runtime(execution, time, "ms"))
             except ValueError:
                 pass
 
@@ -292,40 +428,59 @@ class LastLineParser(ResultParser):
     def __init__(self, subparser: ResultParser) -> None:
         self.subparser = subparser
 
-    def parse(self, run: Run, stdout: str) -> RunResult:
-        for line in reversed(stdout.split("\n")):
-            if line.strip() != "":
-                return self.subparser.parse(run, line)
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        stdout_line = ""
+        for stdout_line in reversed(stdout.split("\n")):
+            if stdout_line.strip() != "":
+                break
 
-        return RunResult(run)
+        stderr_line = ""
+        for stderr_line in reversed(stderr.split("\n")):
+            if stderr_line.strip() != "":
+                break
 
-
-RUNTIME_CRITERION = "runtime"
+        return self.subparser.parse(execution, stdout_line, stderr)
 
 
 class RegexParser(ResultParser):
-    criterion: str
+    metric: str
     regex: re.Pattern[str]
     match_group: str | int
+    unit: str
+    iterations: bool
 
-    def __init__(self, criterion: str, regex: str, match_group: str | int) -> None:
-        self.criterion = criterion
+    def __init__(
+        self,
+        regex: str,
+        match_group: str | int,
+        metric: str,
+        unit: str,
+        iterations: bool = True,
+    ) -> None:
         self.regex = re.compile(regex)
         self.match_group = match_group
+        self.metric = metric
+        self.unit = unit
+        self.iterations = iterations
 
-    def parse(self, run: Run, stdout: str) -> RunResult:
-        result = RunResult(run)
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        result = ExecutionResult()
+        iteration = 1
 
         for line in stdout.split("\n"):
             match = self.regex.match(line)
             if match is not None:
                 value = float(match.group(self.match_group))
 
-                if self.criterion == RUNTIME_CRITERION:
-                    result.new_iteration(runtime=value)
+                if self.iterations:
+                    info = {"iteration": str(iteration)}
+                    iteration += 1
                 else:
-                    it = result.new_iteration()
-                    it.add_criterion(self.criterion, Measurement(value, ""))
+                    info = {}
+
+                result.measurements.append(
+                    Measurement(execution, info, self.metric, value, self.unit)
+                )
 
         return result
 
@@ -362,9 +517,9 @@ class RebenchParser(ResultParser):
         + r"(?P<unit>[a-zA-Z]+)"
     )
 
-    def parse(self, run: Run, stdout: str) -> RunResult:
-        result = RunResult(run)
-        current_iteration = None
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        result = ExecutionResult()
+        iteration = 0
 
         for line in stdout.split("\n"):
             match = self.re_log_line.match(line)
@@ -379,13 +534,12 @@ class RebenchParser(ResultParser):
                 if criterion is not None and criterion.strip() != "total":
                     continue
 
-                # Add time, force new iteration
-                if current_iteration is None:
-                    result.new_iteration(runtime=time)
-                else:
-                    current_iteration.runtime = time
-                    current_iteration = None
-
+                result.measurements.append(
+                    Measurement(
+                        execution, {"iteration": str(iteration)}, "runtime", time, "ms"
+                    )
+                )
+                iteration += 1
                 continue
 
             match = self.re_extra_criterion_log_line.match(line)
@@ -395,16 +549,16 @@ class RebenchParser(ResultParser):
                 unit = match.group("unit")
                 criterion = match.group("criterion")
 
-                if current_iteration is None:
-                    current_iteration = result.new_iteration()
-
                 # Add measurement
-                measure = Measurement(value, unit)
-                current_iteration.add_criterion(criterion, measure)
+                result.measurements.append(
+                    Measurement(
+                        execution, {"iteration": str(iteration)}, criterion, value, unit
+                    )
+                )
 
                 # Force new iteration
-                if measure == "total":
-                    current_iteration = None
+                if criterion == "total":
+                    iteration += 1
                 continue
 
         return result
@@ -416,13 +570,32 @@ class MixedResultParser(ResultParser):
     def __init__(self, *parsers: ResultParser) -> None:
         self.parsers = list(*parsers)
 
-    def parse(self, run: Run, stdout: str) -> RunResult:
-        result = RunResult(run)
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        result = ExecutionResult()
 
         for parser in self.parsers:
-            result |= parser.parse(run, stdout)
+            result.measurements += parser.parse(execution, stdout, stderr).measurements
 
         return result
+
+
+class TimeParser(ResultParser):
+    type Column = Literal["maximum_resident_size", "average_resident_size"]
+
+    time: str
+    columns: list[Column]
+
+    def __init__(self, *columns: Column) -> None:
+        time = shutil.which("time")
+
+        if time is None:
+            raise ValueError("time utility is not available")
+
+        self.time = time
+        self.columns = list(columns)
+
+    def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
+        return super().parse(execution, stdout, stderr)
 
 
 # --------------------------------------
@@ -466,28 +639,40 @@ class TUI:
 
 class Formatter(abc.ABC):
     @abc.abstractmethod
-    def format(self, results: list[RunResult]): ...
+    def format(self, results: list[ExecutionResult]): ...
 
     @staticmethod
-    def get_all_extra_criterions(results: list[RunResult]) -> list[str]:
+    def metrics(results: list[ExecutionResult]) -> list[str]:
         out = []
 
         for result in results:
-            for iter in result.iterations:
-                for crit in iter.criterions.keys():
-                    if crit not in out:
-                        out.append(crit)
+            for measure in result.measurements:
+                if measure.metric not in out:
+                    out.append(measure.metric)
 
         return out
 
     @staticmethod
-    def get_all_info_columns(results: list[RunResult]) -> list[str]:
+    def measurement_info_columns(results: list[ExecutionResult]) -> list[str]:
         out = []
 
         for result in results:
-            for i in result.run.info.keys():
-                if i not in out:
-                    out.append(i)
+            for measure in result.measurements:
+                for col in measure.measurement_info.keys():
+                    if col not in out:
+                        out.append(col)
+
+        return out
+
+    @staticmethod
+    def info_columns(results: list[ExecutionResult]) -> list[str]:
+        out = []
+
+        for result in results:
+            for measure in result.measurements:
+                for col in measure.execution.info.keys():
+                    if col not in out:
+                        out.append(col)
 
         return out
 
@@ -510,15 +695,17 @@ class CsvFormatter(Formatter):
     def format_line(self, line: list[str]) -> str:
         return self.separator.join(map(self.escape_text, line)) + "\n"
 
-    def format(self, results: list[RunResult]):
-        info_cols = Formatter.get_all_info_columns(results)
-        extra_criterions = Formatter.get_all_extra_criterions(results)
+    def format(self, results: list[ExecutionResult]):
+        info_cols = Formatter.info_columns(results)
+        measurement_info_cols = Formatter.measurement_info_columns(results)
+        metrics = Formatter.metrics(results)
 
         columns = (
             ["benchmark", "suite"]
             + info_cols
-            + ["iteration", "runtime"]
-            + extra_criterions
+            + measurement_info_cols
+            + metrics
+            + ["unit"]
         )
 
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
@@ -527,28 +714,83 @@ class CsvFormatter(Formatter):
             file.write(self.format_line(columns))
 
             for result in results:
-                iter_counter = 0
-                for iter in result.iterations:
-                    line: list[str] = [result.run.benchmark_name, result.run.suite]
-
-                    for ic in info_cols:
-                        line.append(result.run.info.get(ic, ""))
-
-                    line += [
-                        str(iter_counter),
-                        str(iter.runtime) if iter.runtime else "",
+                for measure in result.measurements:
+                    line: list[str] = [
+                        measure.execution.benchmark_name,
+                        measure.execution.suite,
                     ]
 
-                    for ec in extra_criterions:
-                        if ec in iter.criterions:
-                            criter = iter.criterions[ec]
-                            # TODO: handle multiple datapoints
-                            line.append(str(criter[0].value))
+                    for col in info_cols:
+                        line.append(measure.execution.info.get(col, ""))
+
+                    for col in measurement_info_cols:
+                        line.append(measure.measurement_info.get(col, ""))
+
+                    for metric in metrics:
+                        if measure.metric == metric:
+                            line.append(str(measure.value))
                         else:
                             line.append("")
 
+                    line.append(measure.unit)
+
                     file.write(self.format_line(line))
-                    iter_counter += 1
+
+
+class FlatCsvFormatter(Formatter):
+    filepath: Path
+    separator: str
+
+    def __init__(self, filepath: Path, separator: str = ",") -> None:
+        self.filepath = filepath
+        self.separator = separator
+
+    @staticmethod
+    def escape_text(text: str) -> str:
+        if "," in text:
+            return '"' + text.replace('"', r"\"") + '"'
+
+        return text
+
+    def format_line(self, line: list[str]) -> str:
+        pprint(line)
+        return self.separator.join(map(self.escape_text, line)) + "\n"
+
+    def format(self, results: list[ExecutionResult]):
+        info_cols = Formatter.info_columns(results)
+        measurement_info_cols = Formatter.measurement_info_columns(results)
+
+        pprint(info_cols)
+        pprint(measurement_info_cols)
+
+        columns = (
+            ["benchmark", "suite"]
+            + info_cols
+            + measurement_info_cols
+            + ["metric", "value", "unit"]
+        )
+
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(self.filepath, "wt") as file:
+            file.write(self.format_line(columns))
+
+            for result in results:
+                for measure in result.measurements:
+                    line: list[str] = [
+                        measure.execution.benchmark_name,
+                        measure.execution.suite,
+                    ]
+
+                    for col in info_cols:
+                        line.append(measure.execution.info.get(col, ""))
+
+                    for col in measurement_info_cols:
+                        line.append(measure.measurement_info.get(col, ""))
+
+                    line += [measure.metric, str(measure.value), measure.unit]
+
+                    file.write(self.format_line(line))
 
 
 # --------------------------------------
@@ -558,11 +800,11 @@ class CsvFormatter(Formatter):
 
 class Executor(abc.ABC):
     @abc.abstractmethod
-    def execute(self, run: Run): ...
+    def execute(self, execution: Execution): ...
 
-    def execute_all(self, runs: list[Run]):
-        for run in runs:
-            self.execute(run)
+    def execute_all(self, executions: list[Execution]):
+        for execution in executions:
+            self.execute(execution)
 
 
 class DefaultExecutor(Executor):
@@ -571,58 +813,60 @@ class DefaultExecutor(Executor):
     failures to reporter
     """
 
-    all_runs: Optional[int]
-    finished_runs: int
-    failed_runs: int
+    all_executions: Optional[int]
+    finished_executions: int
+    failed_executions: int
 
     formatter: Formatter
     crash_folder: Path
 
-    results: list[RunResult]
+    results: list[ExecutionResult]
 
     def __init__(self, crash_folder: Path, formatter: Formatter) -> None:
-        self.all_runs = None
-        self.finished_runs = 0
-        self.failed_runs = 0
+        self.all_executions = None
+        self.finished_executions = 0
+        self.failed_executions = 0
 
         self.formatter = formatter
         self.crash_folder = crash_folder
 
         self.results = []
 
-    def execute_all(self, runs: list[Run]):
-        self.all_runs = len(runs)
-        return super().execute_all(runs)
+    def execute_all(self, executions: list[Execution]):
+        self.all_executions = len(executions)
+        return super().execute_all(executions)
 
-    def execute(self, run: Run):
-        cmd = shutil.which(run.command[0])
+    def execute(self, execution: Execution):
+        cmd = shutil.which(execution.command[0])
         if cmd is None:
-            self.error_run(run, f"Command not found ({run.command[0]})")
+            self.error_execution(
+                execution, f"Command not found ({execution.command[0]})"
+            )
             return
 
-        run.command[0] = cmd
+        execution.command[0] = cmd
 
-        self.start_run(run)
+        self.start_execution(execution)
 
         proc = None
         try:
             # TODO: group, process group?
             proc = subprocess.run(
-                run.command,
+                execution.command,
                 # run spec
                 capture_output=True,
                 check=False,
                 # Popen spec
                 stdin=None,
                 shell=False,
-                cwd=run.working_directory,
-                env=run.env,
+                cwd=execution.working_directory,
+                env=execution.env,
                 text=True,
             )
 
             if proc.returncode != 0:
-                self.error_run(
-                    run,
+                self.error_execution(
+                    execution,
                     f"Program ended with non-zero return code ({proc.returncode})",
                     stdout=proc.stdout,
                     stderr=proc.stderr,
@@ -630,44 +874,46 @@ class DefaultExecutor(Executor):
                 return
 
             self.finalize(
-                run,
+                execution,
                 stdout=proc.stdout,
                 stderr=proc.stderr,
             )
 
         except OSError as e:
-            self.error_run(run, str(e))
+            self.error_execution(execution, str(e))
 
-    def start_run(self, run: Run) -> None:
+    def start_execution(self, execution: Execution) -> None:
         print(
             "["
-            + f"{TUI.RED}{TUI.BOLD}{self.failed_runs}{TUI.RESET}"
-            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_runs}{TUI.RESET}"
+            + f"{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
+            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
             + (
-                f"/{TUI.BLUE}{TUI.BOLD}{self.all_runs}{TUI.RESET}"
-                if self.all_runs is not None
+                f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
+                if self.all_executions is not None
                 else ""
             )
             + "] "
-            + run.as_identifier()
+            + execution.as_identifier()
             + "\n",
             end="",
         )
 
-    def error_run(
+    def error_execution(
         self,
-        run: Run,
+        execution: Execution,
         msg: str,
         stdout: Optional[str] = None,
         stderr: Optional[str] = None,
     ):
-        self.failed_runs += 1
-        print(f"{TUI.RED}{TUI.BOLD}Error in {run.as_identifier()}{TUI.RESET}\n{msg}\n")
+        self.failed_executions += 1
+        print(
+            f"{TUI.RED}{TUI.BOLD}Error in {execution.as_identifier()}{TUI.RESET}\n{msg}\n"
+        )
 
         # TODO: save to folder
 
         if stdout is not None or stderr is not None:
-            run_path = self.crash_folder / run.as_identifier().replace(" ", "_")
+            run_path = self.crash_folder / execution.as_identifier().replace(" ", "_")
             run_path.mkdir(parents=True, exist_ok=True)
 
             if stdout is not None:
@@ -682,9 +928,9 @@ class DefaultExecutor(Executor):
                 f"{TUI.RED}stdout and stderr are saved in {str(run_path)}{TUI.RESET}\n"
             )
 
-    def finalize(self, run: Run, stdout: str, stderr: str) -> None:
-        self.finished_runs += 1
-        self.results.append(run.parser.parse(run, stdout))
+    def finalize(self, execution: Execution, stdout: str, stderr: str) -> None:
+        self.finished_executions += 1
+        self.results.append(execution.parser.parse(execution, stdout, stderr))
 
     def __enter__(self):
         return self
@@ -722,13 +968,13 @@ class DryExecutor(Executor):
     Simple executor which only prints what would be executed
     """
 
-    def execute(self, run: Run):
-        print("Run:", " ".join(run.command))
-        print("Working working_directory:", str(run.working_directory))
+    def execute(self, execution: Execution):
+        print("Execution:", " ".join(execution.command))
+        print("Working working_directory:", str(execution.working_directory))
         print("Environment: ", end="")
-        pprint(run.env)
+        pprint(execution.env)
         print("Info: ", end="")
-        pprint(run.info)
+        pprint(execution.info)
         print("-" * 10)
 
 
@@ -792,6 +1038,7 @@ def main(
     config: Config,
     *params: str,
     formatter: Optional[Formatter] = None,
+    derived: Optional[Callable[[Parameters], Parameters]] = None,
     **kwarg_params: Any,
 ) -> None:
     """
@@ -827,21 +1074,24 @@ def main(
     )
 
     ps = namespace_to_parameters(parser.parse_args())
+    if derived is not None:
+        ps |= derived(ps)
 
-    runs = config_to_runs(config, ps)
+    executions = list(config.to_executions(ps))
 
     output: Path = Path(ps.__output).resolve()
     if formatter is None:
-        formatter = CsvFormatter(output / "results.csv")
+        formatter = FlatCsvFormatter(output / "results.csv")
 
     if ps.__dry:
-        DryExecutor().execute_all(runs)
+        DryExecutor().execute_all(executions)
     elif ps.__jobs > 1:
         # TODO: parallel executor
         pass
     else:
         with DefaultExecutor(output / "crash", formatter) as executor:
-            executor.execute_all(runs)
+            executor.execute_all(executions)
 
 
 # TODO: Catch keyboard_interrupts
+# TODO: Run info - date, reflog
