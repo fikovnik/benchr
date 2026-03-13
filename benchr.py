@@ -50,6 +50,9 @@ class Parameters(SimpleNamespace):
         return Parameters(**vars(ns))
 
 
+TimeBinutilColumns = Literal["maximum_resident_size", "average_resident_size"]
+
+
 # --------------------------------------
 #          INPUT DEFINITIONS
 # --------------------------------------
@@ -80,6 +83,44 @@ class Execution:
             id += ")"
 
         return id
+
+    @dataclass
+    class Incomplete:
+        benchmark_name: str
+        suite: str
+        parser: Optional["ResultParser"]
+
+        command: Optional[Command]
+        working_directory: Optional[Path]
+        env: Env
+
+        info: dict[str, str]
+
+        def finalize(self) -> "Execution":
+            if self.parser is None:
+                raise ValueError(
+                    f"Benchmark {self.benchmark_name} in suite {self.suite} is missing a parser"
+                )
+
+            if self.working_directory is None:
+                raise ValueError(
+                    f"Benchmark {self.benchmark_name} in suite {self.suite} is missing working directory"
+                )
+
+            if self.command is None:
+                raise ValueError(
+                    f"Benchmark {self.benchmark_name} in suite {self.suite} is missing a command"
+                )
+
+            return Execution(
+                benchmark_name=self.benchmark_name,
+                suite=self.suite,
+                parser=self.parser,
+                command=self.command,
+                working_directory=self.working_directory,
+                env=self.env,
+                info=self.info,
+            )
 
 
 @dataclass
@@ -132,21 +173,48 @@ B = Benchmark
 # --------------------------------------
 
 
-class Suite(abc.ABC):
+class BenchmarkCollection[This](abc.ABC):
+    @abc.abstractmethod
+    def apply_suite_decorator(
+        self, decorator: Callable[["Suite"], "Suite"]
+    ) -> This: ...
+
+    def runs(self, value: int) -> This:
+        return self.matrix("run", *range(1, value + 1))
+
+    def matrix[T](
+        self,
+        name: str,
+        *parameters: T,
+        working_directory: Optional[Callable[[T], Path]] = None,
+        env: Optional[Callable[[T], Env]] = None,
+    ) -> This:
+        return self.apply_suite_decorator(
+            lambda suite: MatrixSuite(
+                suite,
+                parameters,
+                working_directory,
+                env,
+            )
+        )
+
+    def time(self, *columns: TimeBinutilColumns) -> This:
+        return self.apply_suite_decorator(lambda suite: TimeSuite(suite, list(columns)))
+
+
+class Suite(BenchmarkCollection["Suite"]):
     """
     A collection of benchmarks. They should all be connected with similar
     structure.
     """
 
+    def apply_suite_decorator(self, decorator: Callable[["Suite"], "Suite"]) -> "Suite":
+        return decorator(self)
+
     @abc.abstractmethod
     def get_executions(
-        self,
-        parameters: Parameters,
-        default_working_directory: Optional[
-            Callable[[Parameters, Benchmark, str], Path]
-        ],
-        default_env: Callable[[Parameters, Benchmark, str], Env],
-    ) -> Iterator[Execution]: ...
+        self, parameters: Parameters
+    ) -> Iterator[Execution.Incomplete]: ...
 
     def to_config(self) -> "Config":
         return Config(self)
@@ -156,20 +224,20 @@ class BaseSuite(Suite):
     name: str
     benchmarks: Callable[[Parameters], list[Benchmark]]
 
-    command: Callable[[Parameters, Benchmark], Command]
+    command: Optional[Callable[[Parameters, Benchmark], Command]]
     working_directory: Optional[Callable[[Parameters, Benchmark], Path]]
     env: Callable[[Parameters, Benchmark], Env]
 
-    parser: "ResultParser"
+    parser: Optional["ResultParser"]
 
     def __init__(
         self,
         name: str,
         benchmarks: Callable[[Parameters], list[Benchmark]],
-        command: Callable[[Parameters, Benchmark], Command],
+        command: Optional[Callable[[Parameters, Benchmark], Command]],
         working_directory: Optional[Callable[[Parameters, Benchmark], Path]],
         env: Callable[[Parameters, Benchmark], Env],
-        parser: "ResultParser",
+        parser: Optional["ResultParser"],
     ) -> None:
         self.name = name
         self.benchmarks = benchmarks
@@ -180,27 +248,26 @@ class BaseSuite(Suite):
 
         self.parser = parser
 
-    def get_executions(
-        self, parameters, default_working_directory, default_env
-    ) -> Iterator[Execution]:
+    def get_executions(self, parameters: Parameters) -> Iterator[Execution.Incomplete]:
         benchs = self.benchmarks(parameters)
 
         if len(benchs) == 0:
             raise ValueError(f"No benchmarks defined in {self.name}!")
 
         for b in benchs:
-            command = self.command(parameters, b)
+            if self.command is not None:
+                command = self.command(parameters, b)
+            else:
+                command = None
 
             if self.working_directory is not None:
                 working_directory = self.working_directory(parameters, b)
-            elif default_working_directory is not None:
-                working_directory = default_working_directory(parameters, b, self.name)
             else:
-                raise ValueError(f"No working directory defined for suite {self.name}")
+                working_directory = None
 
-            env = default_env(parameters, b, self.name) | self.env(parameters, b)
+            env = self.env(parameters, b)
 
-            yield Execution(
+            yield Execution.Incomplete(
                 benchmark_name=b.name,
                 suite=self.name,
                 command=command,
@@ -215,10 +282,10 @@ def suite(
     name: str,
     benchmarks: Sequence[Benchmark | str] | Callable[[Parameters], list[Benchmark]],
     *,
-    command: Callable[[Parameters, Benchmark], Command],
+    command: Optional[Callable[[Parameters, Benchmark], Command]],
     working_directory: Optional[Callable[[Parameters, Benchmark], Path] | Path] = None,
     env: Callable[[Parameters, Benchmark], Env] | Env = {},
-    parser: "ResultParser",
+    parser: Optional["ResultParser"] = None,
 ) -> Suite:
     """
     Flexible way of constructing a Suite
@@ -245,39 +312,198 @@ def suite(
 
 
 # --------------------------------------
+#          SUITE DECORATORS
+# --------------------------------------
+
+
+class SuiteDecorator(Suite):
+    parent: Suite
+
+    def __init__(self, parent: Suite) -> None:
+        self.parent = parent
+
+    def get_executions(self, parameters: Parameters) -> Iterator[Execution.Incomplete]:
+        for pexe in self.parent.get_executions(parameters):
+            for exe in self.extend_execution(parameters, pexe):
+                yield exe
+
+    @abc.abstractmethod
+    def extend_execution(
+        self, parameters: Parameters, execution: Execution.Incomplete
+    ) -> Iterator[Execution.Incomplete]: ...
+
+
+class MatrixSuite[T](SuiteDecorator):
+    parameters: Sequence[T]
+
+    matrix_working_directory: Optional[Callable[[T], Path]]
+    matrix_env: Callable[[T], Env]
+
+    def __init__(
+        self,
+        parent: Suite,
+        parameters: Sequence[T],
+        working_directory: Optional[Callable[[T], Path]] = None,
+        env: Optional[Callable[[T], Env]] = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.parameters = parameters
+        self.matrix_working_directory = working_directory
+
+        if env is None:
+            env = const({})
+        self.matrix_env = env
+
+    def extend_execution(
+        self, parameters: Parameters, execution: Execution.Incomplete
+    ) -> Iterator[Execution.Incomplete]:
+        for p in self.parameters:
+            e = execution.env | self.matrix_env(p)
+
+            if self.matrix_working_directory is not None:
+                wd = self.matrix_working_directory(p)
+            else:
+                wd = execution.working_directory
+
+            yield dataclasses.replace(execution, env=e, working_directory=wd)
+
+
+class TimeSuite(SuiteDecorator):
+    parent: Suite
+    parser: "TimeParser"
+    time_bin: str
+
+    def __init__(
+        self,
+        parent: Suite,
+        columns: list[TimeBinutilColumns],
+        time_bin: Optional[str] = None,
+    ) -> None:
+        super().__init__(parent)
+
+        self.parser = TimeParser(columns)
+
+        if time_bin is None:
+            time_bin = shutil.which("time")
+            if time_bin is None:
+                raise ValueError("Unable to find `time` binary")
+
+        self.time_bin = time_bin
+
+    def extend_execution(
+        self, parameters: Parameters, execution: Execution.Incomplete
+    ) -> Iterator[Execution.Incomplete]:
+        if execution.command is None:
+            raise ValueError("TimeSuite cannot extend an empty command")
+
+        execution.command = [self.time_bin, "-v"] + execution.command
+        execution.parser = self.parser
+        yield execution
+
+
+# --------------------------------------
 #          CONFIGURATION
 # --------------------------------------
 
 
-# TODO: matrix, runs, time
-class Config:
+@dataclass
+class Config(BenchmarkCollection["Config"]):
     """
     The full configuration of all suites.
     """
 
     suites: list[Suite]
 
-    default_working_directory: Optional[Callable[[Parameters, Suite, Benchmark], Path]]
-    default_env: Callable[[Parameters, Suite, Benchmark], Env]
+    default_parser: Optional["ResultParser"]
+    default_command: Optional[Callable[[Parameters, Execution.Incomplete], Command]]
+    default_working_directory: Optional[
+        Callable[[Parameters, Execution.Incomplete], Path]
+    ]
+    default_env: Callable[[Parameters, Execution.Incomplete], Env]
 
     def __init__(
         self,
         *suites: Suite,
     ) -> None:
         self.suites = list(suites)
+        self.default_parser = None
+        self.default_command = None
         self.default_working_directory = None
         self.default_env = const({})
 
+    def command(
+        self,
+        default_command: Optional[
+            Callable[[Parameters, Execution.Incomplete], Command]
+        ],
+    ) -> "Config":
+        return dataclasses.replace(self, default_command=default_command)
+
+    def working_directory(
+        self,
+        default_working_directory: Callable[[Parameters, Execution.Incomplete], Path],
+    ) -> "Config":
+        return dataclasses.replace(
+            self, default_working_directory=default_working_directory
+        )
+
+    def env(
+        self,
+        default_env: Callable[[Parameters, Execution.Incomplete], Env],
+    ) -> "Config":
+        return dataclasses.replace(self, default_env=default_env)
+
     def get_executions(self, parameters: Parameters) -> list[Execution]:
-        return [
-            exe
-            for suite in self.suites
-            for exe in suite.get_executions(
-                parameters,
-                self.default_working_directory,
-                self.default_env,
-            )
-        ]
+        res = []
+        for suite in self.suites:
+            for exe in suite.get_executions(parameters):
+                if exe.parser is None:
+                    if self.default_parser is None:
+                        raise ValueError(
+                            f"No result parser for benchmark {exe.benchmark_name} in suite {exe.suite}"
+                        )
+
+                    exe.parser = self.default_parser
+
+                if exe.command is None:
+                    if self.default_command is None:
+                        raise ValueError(
+                            f"No command for benchmark {exe.benchmark_name} in suite {exe.suite}"
+                        )
+
+                    exe.command = self.default_command(parameters, exe)
+
+                if exe.working_directory is None:
+                    if self.default_working_directory is None:
+                        raise ValueError(
+                            f"No working directory for benchmark {exe.benchmark_name} in suite {exe.suite}"
+                        )
+
+                    exe.working_directory = self.default_working_directory(
+                        parameters, exe
+                    )
+
+                exe.env = self.default_env(parameters, exe) | exe.env
+
+                res.append(
+                    Execution(
+                        benchmark_name=exe.benchmark_name,
+                        suite=exe.suite,
+                        parser=exe.parser,
+                        command=exe.command,
+                        working_directory=exe.working_directory,
+                        env=exe.env,
+                        info=exe.info,
+                    )
+                )
+
+        return res
+
+    def apply_suite_decorator(
+        self, decorator: Callable[["Suite"], "Suite"]
+    ) -> "Config":
+        return dataclasses.replace(self, suites=list(map(decorator, self.suites)))
 
 
 # --------------------------------------
@@ -513,18 +739,9 @@ class MixedResultParser(ResultParser):
 
 
 class TimeParser(ResultParser):
-    type Column = Literal["maximum_resident_size", "average_resident_size"]
+    columns: list[TimeBinutilColumns]
 
-    time: str
-    columns: list[Column]
-
-    def __init__(self, *columns: Column) -> None:
-        time = shutil.which("time")
-
-        if time is None:
-            raise ValueError("time utility is not available")
-
-        self.time = time
+    def __init__(self, columns: list[TimeBinutilColumns]) -> None:
         self.columns = list(columns)
 
     def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
@@ -970,6 +1187,10 @@ __all__ = [
     # Suites of benchmarks
     "Suite",
     "suite",
+    # Suite decorators
+    "SuiteDecorator",
+    "MatrixSuite",
+    "TimeSuite",
     # Configuration
     "Config",
     # Result definitions
