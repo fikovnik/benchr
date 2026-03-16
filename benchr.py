@@ -1094,9 +1094,10 @@ class Executor(abc.ABC):
     @abc.abstractmethod
     def execute(self, execution: Execution): ...
 
-    def execute_all(self, executions: list[Execution]):
+    def execute_all(self, executions: list[Execution]) -> Optional[ExecutionResult]:
         for execution in executions:
             self.execute(execution)
+        return None
 
     def __enter__(self):
         return self
@@ -1130,9 +1131,10 @@ class DefaultExecutor(Executor):
 
         self.result = ExecutionResult()
 
-    def execute_all(self, executions: list[Execution]):
+    def execute_all(self, executions: list[Execution]) -> ExecutionResult:
         self.all_executions = len(executions)
-        return super().execute_all(executions)
+        super().execute_all(executions)
+        return self.result
 
     def execute(self, execution: Execution):
         cmd = shutil.which(execution.command[0])
@@ -1242,6 +1244,7 @@ class ParallelExecutor(DefaultExecutor):
     pool: ThreadPoolExecutor
     lock: Lock
     in_process_runs: int
+    last_info: Optional[str]
 
     def __init__(self, ncores: int, crash_folder: Path, reporter: Reporter) -> None:
         super().__init__(crash_folder, reporter)
@@ -1249,6 +1252,7 @@ class ParallelExecutor(DefaultExecutor):
         self.pool = ThreadPoolExecutor(max_workers=ncores)
         self.lock = Lock()
         self.in_process_runs = 0
+        self.last_info = None
 
     def execute(self, execution: Execution):
         self.pool.submit(super().execute, execution)
@@ -1261,24 +1265,30 @@ class ParallelExecutor(DefaultExecutor):
         super().__exit__(*args)
         return False
 
+    def print_execution(self):
+        assert self.last_info is not None
+
+        print(
+            "["
+            + f"{TUI.MAGENTA}{TUI.BOLD}{self.in_process_runs}{TUI.RESET}"
+            + f"/{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
+            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
+            + (
+                f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
+                if self.all_executions is not None
+                else ""
+            )
+            + "] "
+            + self.last_info
+            + "\n",
+            end="",
+        )
+
     def start_execution(self, execution: Execution) -> None:
         with self.lock:
             self.in_process_runs += 1
-            print(
-                "["
-                + f"{TUI.MAGENTA}{TUI.BOLD}{self.in_process_runs}{TUI.RESET}"
-                + f"/{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
-                + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
-                + (
-                    f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
-                    if self.all_executions is not None
-                    else ""
-                )
-                + "] "
-                + execution.as_identifier()
-                + "\n",
-                end="",
-            )
+            self.last_info = execution.as_identifier()
+            self.print_execution()
 
     def error_execution(self, execution, msg, stdout=None, stderr=None):
         with self.lock:
@@ -1288,6 +1298,7 @@ class ParallelExecutor(DefaultExecutor):
         with self.lock:
             self.in_process_runs -= 1
             super().finalize(execution, stdout, stderr)
+            self.print_execution()
 
 
 class DryExecutor(Executor):
@@ -1360,7 +1371,7 @@ def main(
     reporter: Optional[Reporter] = None,
     executor: Optional[Executor] = None,
     **kwarg_params: Any,
-) -> None:
+) -> Optional[ExecutionResult]:
     """
     Sane default main. config is the benchmarks configuration that will be
     executed, params is a list of required parameters from the user,
@@ -1418,10 +1429,10 @@ def main(
 
     try:
         with executor:
-            executor.execute_all(executions)
+            return executor.execute_all(executions)
     except KeyboardInterrupt:
         print("Interrupted")
-        return
+        sys.exit(0)
 
 
 # TODO: Catch keyboard_interrupts
