@@ -84,6 +84,10 @@ class Execution:
 
     @dataclass
     class Incomplete:
+        """
+        A intermediate state of Execution
+        """
+
         benchmark_name: str
         suite: str
         parser: Optional["ResultParser"]
@@ -126,6 +130,11 @@ class Benchmark:
     """
     A definition of one benchmark. data and keys can be any benchmark-specific
     data that are needed for its execution.
+
+    `data` is specified by positional arguments. If there is a single argument,
+    `data` will not be a tuple but just that argument.
+
+    `keys` are specified by keyword arguments
     """
 
     name: str
@@ -144,6 +153,10 @@ class Benchmark:
 
     @staticmethod
     def from_files(*files: Path) -> list["Benchmark"]:
+        """
+        Create benchmarks from Path, where the name will be the filename
+        without extension, and `keys.path` is the full given path
+        """
         return [
             Benchmark(
                 file.stem,
@@ -154,12 +167,16 @@ class Benchmark:
 
     @staticmethod
     def from_folder(folder: Path, extension: Optional[str] = None) -> list["Benchmark"]:
+        """
+        Recursively walk the given folder, collecting all files with the given
+        extension (or all if no extension is given) into Benchmarks
+        """
         res = []
         for path, _, files in folder.walk():
             for file in files:
                 p = path / file
                 if extension is None or p.suffix.lower() == ("." + extension.lower()):
-                    res.append(path / file)
+                    res.append(p)
 
         return Benchmark.from_files(*res)
 
@@ -172,13 +189,16 @@ B = Benchmark
 
 
 class BenchmarkCollection[This](abc.ABC):
-    @abc.abstractmethod
-    def apply_suite_decorator(
-        self, decorator: Callable[["Suite"], "Suite"]
-    ) -> This: ...
+    """
+    Abstract superclass of Suite and Benchmark - implementation detail
+    """
 
-    def runs(self, value: int) -> This:
-        return self.matrix("run", *range(1, value + 1))
+    @abc.abstractmethod
+    def apply_suite_decorator(self, decorator: Callable[["Suite"], "Suite"]) -> This:
+        """
+        Apply a decorator to all Suites inside this collection
+        """
+        ...
 
     def matrix[T](
         self,
@@ -187,6 +207,16 @@ class BenchmarkCollection[This](abc.ABC):
         working_directory: Optional[Callable[[T], Path]] = None,
         env: Optional[Callable[[T], Env]] = None,
     ) -> This:
+        """
+        Add a matrix parameter. Each benchmark is going to be duplicated with
+        each instance having one value from `parameters`.
+
+        If `working_directory` is not None, it will also change the working
+        directory of each benchmark.
+
+        If `env` is not None, it will add a new environment variables to the
+        benchmarks environment.
+        """
         return self.apply_suite_decorator(
             lambda suite: MatrixSuite(
                 name,
@@ -197,9 +227,19 @@ class BenchmarkCollection[This](abc.ABC):
             )
         )
 
+    def runs(self, value: int) -> This:
+        """
+        Run each benchmark `value` times without any other modification
+        """
+        return self.matrix("run", *range(1, value + 1))
+
     def time(
         self, *columns: TimeBinutilColumns, time_bin: Optional[str] = None
     ) -> This:
+        """
+        Wrap the call to benchmark with the call to `time` (not the shell
+        utility), extracting the information specified by `columns`.
+        """
         return self.apply_suite_decorator(
             lambda suite: TimeSuite(
                 suite,
@@ -211,8 +251,7 @@ class BenchmarkCollection[This](abc.ABC):
 
 class Suite(BenchmarkCollection["Suite"]):
     """
-    A collection of benchmarks. They should all be connected with similar
-    structure.
+    A collection of benchmarks
     """
 
     def apply_suite_decorator(self, decorator: Callable[["Suite"], "Suite"]) -> "Suite":
@@ -224,6 +263,9 @@ class Suite(BenchmarkCollection["Suite"]):
     ) -> Iterator[Execution.Incomplete]: ...
 
     def to_config(self) -> "Config":
+        """
+        Create a simplified config with only one Suite
+        """
         return Config([self])
 
 
@@ -324,6 +366,10 @@ def suite(
 
 
 class SuiteDecorator(Suite):
+    """
+    A Suite that extends another Suite
+    """
+
     parent: Suite
 
     def __init__(self, parent: Suite) -> None:
@@ -337,7 +383,12 @@ class SuiteDecorator(Suite):
     @abc.abstractmethod
     def extend_execution(
         self, parameters: Parameters, execution: Execution.Incomplete
-    ) -> Iterator[Execution.Incomplete]: ...
+    ) -> Iterator[Execution.Incomplete]:
+        """
+        This method needs to be implemented, as it is the one that extends the
+        parent suite
+        """
+        ...
 
 
 class MatrixSuite[T](SuiteDecorator):
@@ -453,6 +504,8 @@ class TimeSuite(SuiteDecorator):
 #          CONFIGURATION
 # --------------------------------------
 
+# TODO: command, wd and env to non-callable
+
 
 @dataclass
 class Config(BenchmarkCollection["Config"]):
@@ -477,12 +530,18 @@ class Config(BenchmarkCollection["Config"]):
             Callable[[Parameters, Execution.Incomplete], Command]
         ],
     ) -> "Config":
+        """
+        Define a default command for all benchmarks
+        """
         return dataclasses.replace(self, default_command=default_command)
 
     def working_directory(
         self,
         default_working_directory: Callable[[Parameters, Execution.Incomplete], Path],
     ) -> "Config":
+        """
+        Define a default working directory for all benchmarks
+        """
         return dataclasses.replace(
             self, default_working_directory=default_working_directory
         )
@@ -491,9 +550,15 @@ class Config(BenchmarkCollection["Config"]):
         self,
         default_env: Callable[[Parameters, Execution.Incomplete], Env],
     ) -> "Config":
+        """
+        Define a default environment for all benchmarks
+        """
         return dataclasses.replace(self, default_env=default_env)
 
     def get_executions(self, parameters: Parameters) -> list[Execution]:
+        """
+        Return all executions for this configuration
+        """
         res = []
         for suite in self.suites:
             for exe in suite.get_executions(parameters):
@@ -586,6 +651,10 @@ class ExecutionResult:
 
 
 class ResultParser(abc.ABC):
+    """
+    Parse stdout and stderr into results
+    """
+
     @abc.abstractmethod
     def parse(
         self, execution: Execution, stdout: str, stderr: str
@@ -593,6 +662,10 @@ class ResultParser(abc.ABC):
 
 
 class PlainSecondsParser(ResultParser):
+    """
+    Try to parse simple floats on each line as seconds
+    """
+
     def parse(self, execution: Execution, stdout: str, stderr: str) -> ExecutionResult:
         result = ExecutionResult()
 
@@ -607,6 +680,10 @@ class PlainSecondsParser(ResultParser):
 
 
 class LastLineParser(ResultParser):
+    """
+    Only parse the last non-empty line
+    """
+
     subparser: ResultParser
 
     def __init__(self, subparser: ResultParser) -> None:
@@ -627,6 +704,10 @@ class LastLineParser(ResultParser):
 
 
 class RegexParser(ResultParser):
+    """
+    Parse the output based on a regex
+    """
+
     type MatchGroup = str | int
     type OutputType = Literal["stdout", "stderr", "both"]
 
@@ -660,6 +741,8 @@ class RegexParser(ResultParser):
         self.match_group = match_group
         self.process = process
 
+        if unit is None and unit_match_group is None:
+            raise ValueError("Missing unit specification")
         self.unit = unit
         self.unit_match_group = unit_match_group
 
@@ -798,6 +881,10 @@ class RebenchParser(ResultParser):
 
 
 class MixedResultParser(ResultParser):
+    """
+    Multiple parsers posing as one
+    """
+
     parsers: list[ResultParser]
 
     def __init__(self, *parsers: ResultParser) -> None:
@@ -813,6 +900,9 @@ class MixedResultParser(ResultParser):
 
 
 def time_parser(columns: list[TimeBinutilColumns]) -> ResultParser:
+    """
+    Create a parser for the `time` binutil
+    """
     parsers = []
 
     def mk_parser(column_name: str, unit: str) -> RegexParser:
@@ -885,11 +975,18 @@ class TUI:
 
 
 class Reporter(abc.ABC):
+    """
+    Reports the results
+    """
+
     @abc.abstractmethod
     def report(self, result: ExecutionResult): ...
 
     @staticmethod
     def metrics(result: ExecutionResult) -> list[str]:
+        """
+        Get all metrics in the result
+        """
         out = []
 
         for measure in result.measurements:
@@ -900,6 +997,9 @@ class Reporter(abc.ABC):
 
     @staticmethod
     def measurement_info_columns(result: ExecutionResult) -> list[str]:
+        """
+        Get all info categories on all measurements
+        """
         out = []
 
         for measure in result.measurements:
@@ -911,6 +1011,9 @@ class Reporter(abc.ABC):
 
     @staticmethod
     def info_columns(result: ExecutionResult) -> list[str]:
+        """
+        Get all info categories on all Executions
+        """
         out = []
 
         for measure in result.measurements:
@@ -922,6 +1025,10 @@ class Reporter(abc.ABC):
 
 
 class MixedReporter(Reporter):
+    """
+    Multiple reporters posing as one
+    """
+
     reporters: list[Reporter]
 
     def __init__(self, *reporters: Reporter) -> None:
@@ -933,6 +1040,10 @@ class MixedReporter(Reporter):
 
 
 class CsvReporter(Reporter):
+    """
+    Report into CSV file
+    """
+
     filepath: Path
     separator: str
 
@@ -984,10 +1095,13 @@ class CsvReporter(Reporter):
 
 
 class TableReporter(Reporter):
+    """
+    Report into CLI
+    """
+
     def report(self, result: ExecutionResult):
         info_cols = Reporter.info_columns(result)
         measurement_info_cols = Reporter.measurement_info_columns(result)
-        metrics = Reporter.metrics(result)
 
         # Measure widths
         benchmark_col_w = len("benchmark")
@@ -1083,10 +1197,21 @@ class TableReporter(Reporter):
 
 
 class Executor(abc.ABC):
+    """
+    Execute the executions
+    """
+
     @abc.abstractmethod
-    def execute(self, execution: Execution): ...
+    def execute(self, execution: Execution):
+        """
+        Run single execution - implementation detail, use `execute_all`
+        """
+        ...
 
     def execute_all(self, executions: list[Execution]) -> Optional[ExecutionResult]:
+        """
+        Run all executions - this is the prefered way of running executions
+        """
         for execution in executions:
             self.execute(execution)
         return None
@@ -1100,8 +1225,7 @@ class Executor(abc.ABC):
 
 class DefaultExecutor(Executor):
     """
-    The main Executor, which executes given commands, reporting success or
-    failures to reporter
+    The main Executor
     """
 
     all_executions: Optional[int]
@@ -1233,6 +1357,10 @@ class DefaultExecutor(Executor):
 
 
 class ParallelExecutor(DefaultExecutor):
+    """
+    An executor that runs multiple tasks in parallel - mostly usable for
+    collecting metrics other that runtime
+    """
     pool: ThreadPoolExecutor
     lock: Lock
     in_process_runs: int
@@ -1295,7 +1423,7 @@ class ParallelExecutor(DefaultExecutor):
 
 class DryExecutor(Executor):
     """
-    Simple executor which only prints what would be executed
+    Pseudo-executor which only prints the execution plan
     """
 
     def execute(self, execution: Execution):
@@ -1359,20 +1487,29 @@ def parse_params(*params: str, **kwarg_params: Any) -> Parameters:
 
 def main(
     config: Config,
-    *params: str,
+    params: list[str],
+    kwarg_params: dict[str, Any],
     reporter: Optional[Reporter] = None,
     executor: Optional[Executor] = None,
-    **kwarg_params: Any,
+    output_folder: Optional[Path] = None,
 ) -> Optional[ExecutionResult]:
     """
     Sane default main. config is the benchmarks configuration that will be
     executed, params is a list of required parameters from the user,
     kwarg_params are optional parameters with their default value.
+
+    If no reporter is specified, it defaults to CSV and CLI report.
+
+    If no executor is specified, it defaults to DefaultExecutor, which can be
+    changed with CLI arguments --dry and --jobs/-j.
+
+    If no output_folder is specified, it defaults to ./output, which can be
+    changed with CLI argument --output.
     """
     parser = make_argparser(*params, **kwarg_params)
 
     defp = parser.add_argument_group("Default benchr parameters")
-    if reporter is None or executor is None:
+    if (reporter is None or executor is None) and output_folder is None:
         defp.add_argument(
             "--output",
             help="Where to store the results (Default: ./output)",
@@ -1403,20 +1540,24 @@ def main(
 
     executions = list(config.get_executions(ps))
 
-    output: Path = Path(ps.__output).resolve()
-    if reporter is None:
-        reporter = MixedReporter(TableReporter(), CsvReporter(output / "results.csv"))
-
     if executor is None:
         if ps.__dry:
             executor = DryExecutor()
-
-        crash_folder = output / "crash"
-
-        if ps.__jobs > 1:
-            executor = ParallelExecutor(ps.__jobs, crash_folder, reporter)
         else:
-            executor = DefaultExecutor(crash_folder, reporter)
+            if output_folder is None:
+                output_folder = Path(ps.__output).resolve()
+
+            if reporter is None:
+                reporter = MixedReporter(
+                    TableReporter(), CsvReporter(output_folder / "results.csv")
+                )
+
+            crash_folder = output_folder / "crash"
+
+            if ps.__jobs > 1:
+                executor = ParallelExecutor(ps.__jobs, crash_folder, reporter)
+            else:
+                executor = DefaultExecutor(crash_folder, reporter)
 
     try:
         with executor:
