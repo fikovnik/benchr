@@ -205,7 +205,7 @@ class BenchmarkCollection[This](abc.ABC):
         name: str,
         *parameters: T,
         working_directory: Optional[Callable[[T], Path]] = None,
-        env: Optional[Callable[[T], Env]] = None,
+        env: Optional[Callable[[T], Env]] | str | Literal[True] = None,
     ) -> This:
         """
         Add a matrix parameter. Each benchmark is going to be duplicated with
@@ -404,7 +404,7 @@ class MatrixSuite[T](SuiteDecorator):
         parent: Suite,
         parameters: Sequence[T],
         working_directory: Optional[Callable[[T], Path]] = None,
-        env: Optional[Callable[[T], Env]] = None,
+        env: Optional[Callable[[T], Env]] | str | Literal[True] = None,
     ) -> None:
         super().__init__(parent)
 
@@ -414,8 +414,13 @@ class MatrixSuite[T](SuiteDecorator):
         self.matrix_working_directory = working_directory
 
         if env is None:
-            env = const({})
-        self.matrix_env = env
+            self.matrix_env = const({})
+        elif env is True:
+            self.matrix_env = lambda p: {name: str(p)}
+        elif isinstance(env, str):
+            self.matrix_env = lambda p: {env: str(p)}
+        else:
+            self.matrix_env = env
 
     def extend_execution(
         self, parameters: Parameters, execution: Execution.Incomplete
