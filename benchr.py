@@ -671,6 +671,39 @@ class Measurement:
 class ExecutionResult:
     measurements: list[Measurement] = dataclasses.field(default_factory=list)
 
+    def to_data_frame(self):
+        import pandas as pd
+
+        info_cols = Reporter.info_columns(self)
+        measurement_info_cols = Reporter.measurement_info_columns(self)
+
+        rows = []
+        for m in self.measurements:
+            row: dict[str, Any] = {
+                "benchmark": m.execution.benchmark_name,
+                "suite": m.execution.suite,
+            }
+
+            for col in info_cols:
+                row[col] = m.execution.info.get(col, "")
+
+            for col in measurement_info_cols:
+                row[col] = m.measurement_info.get(col, "")
+
+            row["metric"] = m.metric
+            row["value"] = m.value
+            row["unit"] = m.unit
+
+            rows.append(row)
+
+        index_cols = ["benchmark", "suite"] + info_cols + measurement_info_cols
+
+        columns = index_cols + ["metric", "value", "unit"]
+
+        df = pd.DataFrame(rows, columns=columns)  # type: ignore
+        df.set_index(index_cols, inplace=True)
+        return df
+
 
 # --------------------------------------
 #           PARSERS
