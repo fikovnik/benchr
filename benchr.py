@@ -1098,6 +1098,12 @@ class Executor(abc.ABC):
         for execution in executions:
             self.execute(execution)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
 
 class DefaultExecutor(Executor):
     """
@@ -1232,30 +1238,56 @@ class DefaultExecutor(Executor):
         return False
 
 
+class ParallelExecutor(DefaultExecutor):
+    pool: ThreadPoolExecutor
+    lock: Lock
+    in_process_runs: int
+
+    def __init__(self, ncores: int, crash_folder: Path, reporter: Reporter) -> None:
+        super().__init__(crash_folder, reporter)
+
+        self.pool = ThreadPoolExecutor(max_workers=ncores)
+        self.lock = Lock()
+        self.in_process_runs = 0
+
+    def execute(self, execution: Execution):
+        self.pool.submit(super().execute, execution)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.pool.shutdown(wait=True)
+        super().__exit__(*args)
         return False
 
+    def start_execution(self, execution: Execution) -> None:
+        with self.lock:
+            self.in_process_runs += 1
+            print(
+                "["
+                + f"{TUI.MAGENTA}{TUI.BOLD}{self.in_process_runs}{TUI.RESET}"
+                + f"/{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
+                + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
+                + (
+                    f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
+                    if self.all_executions is not None
+                    else ""
+                )
+                + "] "
+                + execution.as_identifier()
+                + "\n",
+                end="",
+            )
 
-# class ParallelExecutor(DefaultExecutor):
-#     pool: ThreadPoolExecutor
-#     lock: Lock
-#
-#     in_process_runs: int
-#
-#     def __init__(self, ncores: int) -> None:
-#         super().__init__()
-#         self.pool = ThreadPoolExecutor(max_workers=ncores)
-#         self.lock = Lock()
-#
-#     def execute(self, run: Run):
-#         self.pool.submit(super().execute, run)
-#
-#     def __enter__(self):
-#         return self
-#
-#     def __exit__(self, *args):
-#         self.pool.shutdown(wait=True)
-#         super().__exit__(*args)
-#         return False
+    def error_execution(self, execution, msg, stdout=None, stderr=None):
+        with self.lock:
+            super().error_execution(execution, msg, stdout, stderr)
+
+    def finalize(self, execution: Execution, stdout: str, stderr: str) -> None:
+        with self.lock:
+            self.in_process_runs -= 1
+            super().finalize(execution, stdout, stderr)
 
 
 class DryExecutor(Executor):
@@ -1326,6 +1358,7 @@ def main(
     config: Config,
     *params: str,
     reporter: Optional[Reporter] = None,
+    executor: Optional[Executor] = None,
     **kwarg_params: Any,
 ) -> None:
     """
@@ -1336,29 +1369,32 @@ def main(
     parser = make_argparser(*params, **kwarg_params)
 
     defp = parser.add_argument_group("Default benchr parameters")
-    defp.add_argument(
-        "--output",
-        help="Where to store the results (Default: ./output)",
-        metavar="file",
-        type=str,
-        default="./output",
-        dest="__output",
-    )
-    defp.add_argument(
-        "--jobs",
-        "-j",
-        help="Allow this many runs in parallel (Default: 1)",
-        metavar="jobs",
-        type=int,
-        default=1,
-        dest="__jobs",
-    )
-    defp.add_argument(
-        "--dry",
-        help="Do not run, only print what would be runned",
-        action="store_true",
-        dest="__dry",
-    )
+    if reporter is None or executor is None:
+        defp.add_argument(
+            "--output",
+            help="Where to store the results (Default: ./output)",
+            metavar="file",
+            type=str,
+            default="./output",
+            dest="__output",
+        )
+
+    if executor is None:
+        defp.add_argument(
+            "--jobs",
+            "-j",
+            help="Allow this many runs in parallel (Default: 1)",
+            metavar="jobs",
+            type=int,
+            default=1,
+            dest="__jobs",
+        )
+        defp.add_argument(
+            "--dry",
+            help="Do not run, only print what would be runned",
+            action="store_true",
+            dest="__dry",
+        )
 
     ps = Parameters.from_namespace(parser.parse_args())
 
@@ -1368,14 +1404,24 @@ def main(
     if reporter is None:
         reporter = CsvReporter(output / "results.csv")
 
-    if ps.__dry:
-        DryExecutor().execute_all(executions)
-    elif ps.__jobs > 1:
-        # TODO: parallel executor
-        pass
-    else:
-        with DefaultExecutor(output / "crash", reporter) as executor:
+    if executor is None:
+        if ps.__dry:
+            executor = DryExecutor()
+
+        crash_folder = output / "crash"
+        reporter = MixedReporter(TableReporter(), reporter)
+
+        if ps.__jobs > 1:
+            executor = ParallelExecutor(ps.__jobs, crash_folder, reporter)
+        else:
+            executor = DefaultExecutor(crash_folder, reporter)
+
+    try:
+        with executor:
             executor.execute_all(executions)
+    except KeyboardInterrupt:
+        print("Interrupted")
+        return
 
 
 # TODO: Catch keyboard_interrupts
@@ -1421,6 +1467,7 @@ __all__ = [
     # Executors
     "Executor",
     "DefaultExecutor",
+    "ParallelExecutor",
     "DryExecutor",
     # ArgumentParsing
     "make_argparser",
