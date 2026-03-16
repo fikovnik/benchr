@@ -1405,14 +1405,13 @@ def main(
 
     output: Path = Path(ps.__output).resolve()
     if reporter is None:
-        reporter = CsvReporter(output / "results.csv")
+        reporter = MixedReporter(TableReporter(), CsvReporter(output / "results.csv"))
 
     if executor is None:
         if ps.__dry:
             executor = DryExecutor()
 
         crash_folder = output / "crash"
-        reporter = MixedReporter(TableReporter(), reporter)
 
         if ps.__jobs > 1:
             executor = ParallelExecutor(ps.__jobs, crash_folder, reporter)
