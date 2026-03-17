@@ -37,14 +37,16 @@ if __name__ == "__main__":
     )
     assert results is not None
 
-    df = results.to_data_frame()
+    # df = results.to_data_frame()
+    # df["value"] = np.where(
+    #     df["metric"] == "clock_time", df["value"] * 1000, df["value"]
+    # )
+    # df.drop("unit", axis=1, inplace=True)
+    # df = df.pivot(columns="metri")
+    # df.columns = df.columns.droplevel(0)
 
-    df["value"] = np.where(
-        df["metric"] == "clock_time", df["value"] * 1000, df["value"]
-    )
-    df.drop("unit", axis=1, inplace=True)
-    df = df.pivot(columns="metric")
-    df.columns = df.columns.droplevel(0)
+    df = results.to_data_frame(pivoted=True)
+
     df = df.groupby(["benchmark", "suite"]).mean()
     df.reset_index(inplace=True)
     print(df)

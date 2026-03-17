@@ -671,8 +671,11 @@ class Measurement:
 class ExecutionResult:
     measurements: list[Measurement] = dataclasses.field(default_factory=list)
 
-    def to_data_frame(self):
+    def to_data_frame(self, pivoted: bool = False, units: Optional[bool] = None):
         import pandas as pd
+
+        if units is None:
+            units = not pivoted
 
         info_cols = Reporter.info_columns(self)
         measurement_info_cols = Reporter.measurement_info_columns(self)
@@ -690,17 +693,21 @@ class ExecutionResult:
             for col in measurement_info_cols:
                 row[col] = m.measurement_info.get(col, "")
 
-            row["metric"] = m.metric
-            row["value"] = m.value
-            row["unit"] = m.unit
+            if pivoted:
+                row[m.metric] = m.value
+                if units:
+                    row[m.metric + "_unit"] = m.unit
+            else:
+                row["metric"] = m.metric
+                row["value"] = m.value
+                if units:
+                    row["unit"] = m.unit
 
             rows.append(row)
 
         index_cols = ["benchmark", "suite"] + info_cols + measurement_info_cols
 
-        columns = index_cols + ["metric", "value", "unit"]
-
-        df = pd.DataFrame(rows, columns=columns)  # type: ignore
+        df = pd.DataFrame(rows)
         df.set_index(index_cols, inplace=True)
         return df
 
