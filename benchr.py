@@ -271,6 +271,17 @@ class BenchmarkCollection[This](abc.ABC):
             )
         )
 
+    def timeout(self, timeout: float) -> This:
+        """
+        Set the timeout of benchmarks (in seconds)
+        """
+        return self.apply_suite_decorator(
+            lambda suite: TimeoutSuite(
+                suite,
+                timeout,
+            )
+        )
+
 
 class Suite(BenchmarkCollection["Suite"]):
     """
@@ -609,6 +620,24 @@ class TimeSuite(SuiteDecorator):
             execution.parser = self.parser
         else:
             execution.parser = MixedResultParser(execution.parser, self.parser)
+        yield execution
+
+
+class TimeoutSuite(SuiteDecorator):
+    timeout_value: float
+
+    def __init__(
+        self,
+        parent: Suite,
+        timeout_value: float,
+    ) -> None:
+        super().__init__(parent)
+        self.timeout_value = timeout_value
+
+    def extend_execution(
+        self, parameters: Parameters, execution: Execution.Incomplete
+    ) -> Iterator[Execution.Incomplete]:
+        execution.timeout = self.timeout_value
         yield execution
 
 
@@ -1830,6 +1859,7 @@ __all__ = [
     "MatrixSuite",
     "Matrix",
     "TimeSuite",
+    "TimeoutSuite",
     # Configuration
     "Config",
     # Result definitions
