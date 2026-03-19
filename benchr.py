@@ -852,6 +852,10 @@ class ResultParser(abc.ABC):
         """
         return NoteTimeoutParserDecorator(self, runtime_metric)
 
+    def kind(
+        self, measure_kind: "MeasurementKindParserDecorator.Kind"
+    ) -> "ResultParser":
+        return MeasurementKindParserDecorator(self, measure_kind)
 
     def __and__(self, other) -> "ResultParser":
         return MixedResultParser(self, other)
@@ -1347,6 +1351,25 @@ class NoteTimeoutParserDecorator(ResultParser):
         # If there is no measurement of the `runtime_metric`, add the dummy_measure
         if not any(map(lambda m: m.metric == self.runtime_metric, result.measurements)):
             result.measurements.append(dummy_measure)
+
+        return result
+
+
+class MeasurementKindParserDecorator(ResultParser):
+    Kind = Literal["LIB", "HIB"]  # Lower / Higher is Better
+
+    subparser: ResultParser
+    measure_kind: Kind
+
+    def __init__(self, subparser: ResultParser, measure_kind: Kind) -> None:
+        self.subparser = subparser
+        self.measure_kind = measure_kind
+
+    def parse(self, process_result: ProcessResult) -> ExecutionResult:
+        result = self.subparser.parse(process_result)
+
+        for m in result.measurements:
+            m.measurement_info["kind"] = self.measure_kind
 
         return result
 
@@ -2033,6 +2056,7 @@ __all__ = [
     "IgnoreFailParserDecorator",
     "NoteFailureParserDecorator",
     "NoteTimeoutParserDecorator",
+    "MeasurementKindParserDecorator",
     # Reporters
     "Reporter",
     "MixedReporter",
