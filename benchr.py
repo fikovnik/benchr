@@ -300,7 +300,7 @@ class Suite(BenchmarkCollection["Suite"]):
         """
         Create a simplified config with only one Suite
         """
-        return Config(self)
+        return Config([self])
 
 
 class BaseSuite(Suite):
@@ -603,9 +603,6 @@ class Config(BenchmarkCollection["Config"]):
     ] = None
     default_env: Callable[[Parameters, Execution.Incomplete], Env] = const({})
 
-    def __init__(self, *suites: Suite) -> None:
-        self.suites = list(suites)
-
     def parser(self, default_parser: "ResultParser") -> "Config":
         if self.default_parser is not None:
             raise ValueError("Multiple definitions of default parser")
@@ -620,7 +617,7 @@ class Config(BenchmarkCollection["Config"]):
         """
         Define a default command for all benchmarks
         """
-        if self.command is not None:
+        if self.default_command is not None:
             raise ValueError("Multiple definitions of default command")
 
         if not callable(default_command):
@@ -636,7 +633,7 @@ class Config(BenchmarkCollection["Config"]):
         """
         Define a default working directory for all benchmarks
         """
-        if self.working_directory is not None:
+        if self.default_working_directory is not None:
             raise ValueError("Multiple definitions of default working directory")
 
         if not callable(default_working_directory):
