@@ -60,6 +60,7 @@ TimeBinutilColumns = Literal[
 @dataclass
 class SuccesfulProcessResult:
     execution: "Execution"
+    runtime: float
     stdout: str
     stderr: str
     rusage: Optional[resource.struct_rusage]
@@ -68,12 +69,28 @@ class SuccesfulProcessResult:
 @dataclass
 class FailedProcessResult:
     execution: "Execution"
+    runtime: Optional[float]
     stdout: Optional[str]
     stderr: Optional[str]
     rusage: Optional[resource.struct_rusage]
 
     returncode: int
     reason: Literal["timed_out", "non_zero_returncode"] | str
+
+    @staticmethod
+    def empty(
+        execution: "Execution",
+        reason: Literal["timed_out", "non_zero_returncode"] | str,
+    ) -> "FailedProcessResult":
+        return FailedProcessResult(
+            execution=execution,
+            runtime=None,
+            stdout=None,
+            stderr=None,
+            rusage=None,
+            returncode=0,
+            reason=reason,
+        )
 
 
 ProcessResult = SuccesfulProcessResult | FailedProcessResult
@@ -1469,12 +1486,8 @@ class DefaultExecutor(Executor):
         cmd = shutil.which(execution.command[0])
         if cmd is None:
             self.error_execution(
-                FailedProcessResult(
+                FailedProcessResult.empty(
                     execution=execution,
-                    stdout=None,
-                    stderr=None,
-                    rusage=None,
-                    returncode=0,
                     reason=f"Command not found ({execution.command[0]})",
                 )
             )
@@ -1495,11 +1508,12 @@ class DefaultExecutor(Executor):
                 text=True,
                 shell=False,
             )
+            starttime = time.monotonic()
 
             rusage = None
             timed_out = False
             if execution.timeout is not None:
-                endtime = time.monotonic() + execution.timeout
+                stoptime = time.monotonic() + execution.timeout
 
                 # Busy wait
                 while True:
@@ -1512,7 +1526,7 @@ class DefaultExecutor(Executor):
                     if pid == proc.pid:
                         break
 
-                    if endtime - time.monotonic() <= 0:
+                    if stoptime - time.monotonic() <= 0:
                         timed_out = True
             else:
                 try:
@@ -1520,11 +1534,14 @@ class DefaultExecutor(Executor):
                 except ChildProcessError:
                     ...
 
+            endtime = time.monotonic()
+            runtime = endtime - starttime
             stdout, stderr = proc.communicate()
 
             if timed_out or proc.returncode != 0:
                 result = FailedProcessResult(
                     execution=execution,
+                    runtime=runtime,
                     stdout=stdout,
                     stderr=stderr,
                     rusage=rusage,
@@ -1535,6 +1552,7 @@ class DefaultExecutor(Executor):
             else:
                 result = SuccesfulProcessResult(
                     execution=execution,
+                    runtime=runtime,
                     stdout=stdout,
                     stderr=stderr,
                     rusage=rusage,
@@ -1544,12 +1562,8 @@ class DefaultExecutor(Executor):
 
         except OSError as e:
             self.error_execution(
-                FailedProcessResult(
+                FailedProcessResult.empty(
                     execution=execution,
-                    stdout=None,
-                    stderr=None,
-                    rusage=None,
-                    returncode=0,
                     reason=str(e),
                 )
             )
