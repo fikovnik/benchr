@@ -48,15 +48,6 @@ class Parameters(SimpleNamespace):
         return Parameters(**vars(ns))
 
 
-TimeBinutilColumns = Literal[
-    "maximum_resident_size",
-    "average_resident_size",
-    "user_time",
-    "system_time",
-    "clock_time",
-]
-
-
 @dataclass
 class SuccesfulProcessResult:
     execution: "Execution"
@@ -95,6 +86,11 @@ class FailedProcessResult:
 
 ProcessResult = SuccesfulProcessResult | FailedProcessResult
 
+ResourceMetric = Literal[
+    "maximum_resident_size",
+    "user_time",
+    "system_time",
+]
 
 # --------------------------------------
 #          INPUT DEFINITIONS
@@ -272,21 +268,6 @@ class BenchmarkCollection[This](abc.ABC):
         Run each benchmark `value` times without any other modification
         """
         return self.matrix(Matrix("run", range(1, value + 1)))
-
-    def time(
-        self, *columns: TimeBinutilColumns, time_bin: Optional[str] = None
-    ) -> This:
-        """
-        Wrap the call to benchmark with the call to `time` (not the shell
-        utility), extracting the information specified by `columns`.
-        """
-        return self.apply_suite_decorator(
-            lambda suite: TimeSuite(
-                suite,
-                list(columns),
-                time_bin=time_bin,
-            )
-        )
 
     def timeout(self, timeout: float) -> This:
         """
@@ -576,68 +557,6 @@ class Matrix[T]:
             matrix_env=self.matrix_env,
             matrix_info=self.matrix_info,
         )
-
-
-class TimeSuite(SuiteDecorator):
-    parent: Suite
-    parser: "ResultParser"
-    format: str
-    time_bin: str
-
-    def __init__(
-        self,
-        parent: Suite,
-        columns: list[TimeBinutilColumns],
-        time_bin: Optional[str] = None,
-    ) -> None:
-        super().__init__(parent)
-
-        self.parser = time_parser(columns)
-        self.format = TimeSuite.make_format(columns)
-
-        if time_bin is None:
-            time_bin = shutil.which("time")
-            if time_bin is None:
-                raise ValueError("Unable to find `time` binary")
-
-        self.time_bin = time_bin
-
-    @staticmethod
-    def make_format(columns: list[TimeBinutilColumns]) -> str:
-        format = ""
-        for col in columns:
-            if col == "maximum_resident_size":
-                format += "maximum_resident_size: %M\n"
-
-            elif col == "average_resident_size":
-                format += "average_resident_size: %t\n"
-
-            elif col == "user_time":
-                format += "user_time: %U\n"
-
-            elif col == "system_time":
-                format += "system_time: %S\n"
-
-            elif col == "clock_time":
-                format += "clock_time: %e\n"
-
-            else:
-                raise ValueError(f"Unknown Time column {col}")
-
-        return format
-
-    def extend_execution(
-        self, parameters: Parameters, execution: Execution.Incomplete
-    ) -> Iterator[Execution.Incomplete]:
-        if execution.command is None:
-            raise ValueError("TimeSuite cannot extend an empty command")
-
-        execution.command = [self.time_bin, "-f", self.format] + execution.command
-        if execution.parser is None:
-            execution.parser = self.parser
-        else:
-            execution.parser = MixedResultParser(execution.parser, self.parser)
-        yield execution
 
 
 class TimeoutSuite(SuiteDecorator):
@@ -1170,42 +1089,119 @@ class MixedResultParser(ResultParser):
         return result
 
 
-def time_parser(columns: list[TimeBinutilColumns]) -> ResultParser:
+class ClockTimeParser(ResultParser):
     """
-    Create a parser for the `time` binutil
+    Capture the outer runtime of a process
+    """
+
+    def parse(self, process_result: ProcessResult) -> ExecutionResult:
+        if process_result.runtime is None:
+            return ExecutionResult()
+
+        return ExecutionResult(
+            [
+                Measurement(
+                    execution=process_result.execution,
+                    metric="clock_time",
+                    value=process_result.runtime,
+                    unit="s",
+                    measurement_info={},
+                )
+            ]
+        )
+
+
+class ResourceUsageParser(ResultParser):
+    RUsageField = Literal[
+        "ru_utime",
+        "ru_stime",
+        "ru_maxrss",
+        "ru_ixrss",
+        "ru_idrss",
+        "ru_isrss",
+        "ru_minflt",
+        "ru_majflt",
+        "ru_nswap",
+        "ru_inblock",
+        "ru_oublock",
+        "ru_msgsnd",
+        "ru_msgrcv",
+        "ru_nsignals",
+        "ru_nvcsw",
+        "ru_nivcsw",
+    ]
+
+    field: RUsageField
+    metric: str
+    unit: str
+
+    def __init__(self, field: RUsageField, metric: str, unit: str) -> None:
+        self.field = field
+        self.metric = metric
+        self.unit = unit
+
+    def parse(self, process_result: ProcessResult) -> ExecutionResult:
+        if process_result.runtime is None:
+            return ExecutionResult()
+
+        value = getattr(process_result.runtime, self.field)
+
+        # MacOS reports in B, not kB
+        if sys.platform == "darwin" and self.field == "ru_maxrss":
+            value /= 1024
+
+        return ExecutionResult(
+            [
+                Measurement(
+                    execution=process_result.execution,
+                    metric=self.metric,
+                    value=value,
+                    unit=self.unit,
+                    measurement_info={},
+                )
+            ]
+        )
+
+
+def resource_usage_parser(*columns: ResourceMetric) -> ResultParser:
+    """
+    Create a parser for resourece metrics
     """
     parsers = []
 
-    def mk_parser(column_name: str, unit: str) -> RegexParser:
-        return RegexParser(
-            column_name,
-            re.compile(
-                rf"^{column_name}: (\d+\.?\d*)$",
-                re.MULTILINE,
-            ),
-            "stderr",
-            match_group=1,
-            unit=unit,
-        )
-
     for col in columns:
         if col == "maximum_resident_size":
-            parsers.append(mk_parser("maximum_resident_size", "kB"))
-
-        elif col == "average_resident_size":
-            parsers.append(mk_parser("average_resident_size", "kB"))
+            parsers.append(
+                ResourceUsageParser(
+                    "ru_maxrss",
+                    "maximum_resident_size",
+                    "kB",
+                )
+            )
 
         elif col == "user_time":
-            parsers.append(mk_parser("user_time", "s"))
+            parsers.append(
+                ResourceUsageParser(
+                    "ru_utime",
+                    "user_time",
+                    "s",
+                )
+            )
 
         elif col == "system_time":
-            parsers.append(mk_parser("system_time", "s"))
-
-        elif col == "clock_time":
-            parsers.append(mk_parser("clock_time", "s"))
+            parsers.append(
+                ResourceUsageParser(
+                    "ru_stime",
+                    "system_time",
+                    "s",
+                )
+            )
 
         else:
-            raise ValueError(f"Unknown Time column {col}")
+            raise ValueError(f"Unknown resource metric column {col}")
+
+    if len(parsers) == 1:
+        return parsers[0]
 
     return MixedResultParser(*parsers)
 
@@ -1857,10 +1853,10 @@ __all__ = [
     "Env",
     "Command",
     "Parameters",
-    "TimeBinutilColumns",
     "ProcessResult",
     "SuccesfulProcessResult",
     "FailedProcessResult",
+    "ResourceMetric",
     # Input definitions
     "Execution",
     "Benchmark",
@@ -1872,7 +1868,6 @@ __all__ = [
     "SuiteDecorator",
     "MatrixSuite",
     "Matrix",
-    "TimeSuite",
     "TimeoutSuite",
     # Configuration
     "Config",
@@ -1886,7 +1881,9 @@ __all__ = [
     "RegexParser",
     "RebenchParser",
     "MixedResultParser",
-    "time_parser",
+    "ClockTimeParser",
+    "ResourceUsageParser",
+    "resource_usage_parser",
     # Reporters
     "Reporter",
     "MixedReporter",
