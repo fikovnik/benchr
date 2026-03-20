@@ -45,17 +45,16 @@ conf = (
                     LastLineParser(PlainFloatParser("s"))
                     & ResourceUsageParser("maximum_resident_size")
                     & ClockTimeParser()
-                )
-                .kind("LIB")
-                .note_failure()
-                .note_timeout(),
-            ),
+                ).kind("LIB")  # All of them are less is better
+                & FailedParser()
+                & TimedOutParser(),
+            ).timeout(20),
             suite(
                 name="ZooBatch",
                 benchmarks=lambda ps: [
                     B("zoo_batch", path=ps.cwd / "benchmarks" / "zoo_batch.lox")
                 ],
-                parser=ZooBatchParser().kind("HIB").note_failure(),
+                parser=ZooBatchParser().kind("HIB") & FailedParser(),
             ).timeout(12),
         ]
     )
