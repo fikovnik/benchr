@@ -1622,6 +1622,7 @@ class DefaultExecutor(Executor):
             starttime = time.monotonic()
 
             rusage = None
+            waitstatus = None
             timed_out = False
             if execution.timeout is not None:
                 stoptime = time.monotonic() + execution.timeout
@@ -1629,7 +1630,7 @@ class DefaultExecutor(Executor):
                 # Busy wait
                 while True:
                     try:
-                        pid, _, rusage = os.wait4(proc.pid, os.WNOHANG)
+                        pid, waitstatus, rusage = os.wait4(proc.pid, os.WNOHANG)
                         assert pid == proc.pid or pid == 0
                     except ChildProcessError:
                         break
@@ -1641,22 +1642,23 @@ class DefaultExecutor(Executor):
                         timed_out = True
             else:
                 try:
-                    _, _, rusage = os.wait4(proc.pid, 0)
+                    _, waitstatus, rusage = os.wait4(proc.pid, 0)
                 except ChildProcessError:
                     ...
 
             endtime = time.monotonic()
             runtime = endtime - starttime
             stdout, stderr = proc.communicate()
+            returncode = os.waitstatus_to_exitcode(waitstatus)
 
-            if timed_out or proc.returncode != 0:
+            if timed_out or returncode != 0:
                 result = FailedProcessResult(
                     execution=execution,
                     runtime=runtime,
                     stdout=stdout,
                     stderr=stderr,
                     rusage=rusage,
-                    returncode=proc.returncode,
+                    returncode=returncode,
                     reason="timed_out" if timed_out else "non_zero_returncode",
                 )
                 self.error_execution(result)
