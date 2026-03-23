@@ -7,6 +7,7 @@ import re
 import resource
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1608,15 +1609,16 @@ class DefaultExecutor(Executor):
 
         self.start_execution(execution)
 
+        stdout_file = tempfile.TemporaryFile()
+        stderr_file = tempfile.TemporaryFile()
         try:
             proc = subprocess.Popen(
                 execution.command,
                 cwd=execution.working_directory,
                 env=execution.env,
                 stdin=None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
                 shell=False,
             )
             starttime = time.monotonic()
@@ -1640,6 +1642,18 @@ class DefaultExecutor(Executor):
 
                     if stoptime - time.monotonic() <= 0:
                         timed_out = True
+                        proc.kill()
+                        break
+
+                    time.sleep(0.01)
+
+            if timed_out:
+                # Reap the killed process to get waitstatus/rusage
+                try:
+                    _, waitstatus, rusage = os.wait4(proc.pid, 0)
+                except ChildProcessError:
+                    ...
+
             else:
                 try:
                     _, waitstatus, rusage = os.wait4(proc.pid, 0)
@@ -1648,7 +1662,10 @@ class DefaultExecutor(Executor):
 
             endtime = time.monotonic()
             runtime = endtime - starttime
-            stdout, stderr = proc.communicate()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(errors="replace")
+            stderr = stderr_file.read().decode(errors="replace")
             returncode = os.waitstatus_to_exitcode(waitstatus)
 
             if timed_out or returncode != 0:
@@ -1680,6 +1697,9 @@ class DefaultExecutor(Executor):
                     reason=str(e),
                 )
             )
+        finally:
+            stdout_file.close()
+            stderr_file.close()
 
     def start_execution(self, execution: Execution) -> None:
         print(
