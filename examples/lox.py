@@ -16,7 +16,7 @@ class ZooBatchParser(ResultParser):
                                     execution=process_result.execution,
                                     metric="throughput",
                                     value=value,
-                                    unit="iteration",
+                                    unit="iter",
                                     measurement_info={},
                                 )
                             ]
@@ -43,11 +43,10 @@ conf = (
                 ),
                 parser=(
                     LastLineParser(PlainFloatParser("s"))
-                    & ResourceUsageParser("maximum_resident_size")
+                    & ResourceUsageParser("max_rss")
                     & ClockTimeParser()
                 ).kind("LIB")  # All of them are less is better
-                & FailedParser()
-                & TimedOutParser(),
+                & FailedParser(),
             ).timeout(20),
             suite(
                 name="ZooBatch",

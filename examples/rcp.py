@@ -61,7 +61,7 @@ def rcp_main():
             suite(
                 name="RCPSuite",
                 benchmarks=benchmarks,
-                parser=RebenchParser() & ResourceUsageParser("maximum_resident_size"),
+                parser=RebenchParser() & ResourceUsageParser("max_rss"),
                 working_directory=CWD,
                 command=lambda _, benchmark: (
                     [
