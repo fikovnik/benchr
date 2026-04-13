@@ -92,12 +92,6 @@ class FailedProcessResult:
 
 ProcessResult = SuccesfulProcessResult | FailedProcessResult
 
-ResourceMetric = Literal[
-    "max_rss",
-    "user_time",
-    "system_time",
-]
-
 # --------------------------------------
 #          INPUT DEFINITIONS
 # --------------------------------------
@@ -120,14 +114,15 @@ class Execution:
     timeout: Optional[float]
 
     info: dict[str, str]
+    run: int = 1
 
     def as_identifier(self) -> str:
         id = f"{self.suite},{self.benchmark_name}"
 
-        if len(self.info) != 0:
-            id += " ("
-            id += ", ".join((f"{k}={v}" for k, v in self.info.items()))
-            id += ")"
+        parts = [f"{k}={v}" for k, v in self.info.items()]
+        parts.append(f"run={self.run}")
+        if parts:
+            id += " (" + ", ".join(parts) + ")"
 
         return id
 
@@ -151,6 +146,7 @@ class Execution:
         timeout: Optional[float]
 
         info: dict[str, str]
+        run: int = 1
 
         def finalize(self) -> "Execution":
             if self.parser is None:
@@ -177,6 +173,7 @@ class Execution:
                 env=self.env,
                 timeout=self.timeout,
                 info=self.info,
+                run=self.run,
             )
 
 
@@ -275,7 +272,7 @@ class BenchmarkCollection[This](abc.ABC):
         """
         Run each benchmark `value` times without any other modification
         """
-        return self.matrix(Matrix("run", range(1, value + 1)))
+        return self.apply_suite_decorator(lambda suite: RunsSuite(suite, value))
 
     def timeout(self, timeout: float) -> This:
         """
@@ -494,6 +491,20 @@ class MatrixSuite[T](SuiteDecorator):
                 working_directory=wd,
                 info=i,
             )
+
+
+class RunsSuite(SuiteDecorator):
+    count: int
+
+    def __init__(self, parent: Suite, count: int) -> None:
+        super().__init__(parent)
+        self.count = count
+
+    def extend_execution(
+        self, parameters: Parameters, execution: Execution.Incomplete
+    ) -> Iterator[Execution.Incomplete]:
+        for i in range(1, self.count + 1):
+            yield dataclasses.replace(execution, run=i)
 
 
 @dataclass
@@ -721,23 +732,21 @@ class Measurement:
     execution: Execution
     metric: str
     value: float
-    unit: str
-
-    measurement_info: dict[str, str]
+    unit: str = ""
+    # True = lower is better, False = higher is better, None = not comparable
+    lower_is_better: Optional[bool] = None
 
     @staticmethod
     def runtime(
         execution: Execution,
         value: float,
         unit: str,
-        measurement_info: dict[str, str] = {},
     ) -> "Measurement":
         return Measurement(
             execution=execution,
             metric="runtime",
             value=value,
             unit=unit,
-            measurement_info=measurement_info,
         )
 
 
@@ -753,19 +762,6 @@ class ExecutionResult:
 
         for measure in self.measurements:
             for col in measure.execution.info.keys():
-                if col not in out:
-                    out.append(col)
-
-        return out
-
-    def measurement_info_columns(self) -> list[str]:
-        """
-        Get all info categories on all measurements
-        """
-        out = []
-
-        for measure in self.measurements:
-            for col in measure.measurement_info.keys():
                 if col not in out:
                     out.append(col)
 
@@ -790,20 +786,19 @@ class ExecutionResult:
             units = not pivoted
 
         info_cols = self.info_columns()
-        measurement_info_cols = self.measurement_info_columns()
 
         rows = []
         for m in self.measurements:
             row: dict[str, Any] = {
                 "benchmark": m.execution.benchmark_name,
                 "suite": m.execution.suite,
+                "run": m.execution.run,
             }
 
             for col in info_cols:
                 row[col] = m.execution.info.get(col, "")
 
-            for col in measurement_info_cols:
-                row[col] = m.measurement_info.get(col, "")
+            row["lower_is_better"] = m.lower_is_better
 
             if pivoted:
                 row[m.metric] = m.value
@@ -817,7 +812,7 @@ class ExecutionResult:
 
             rows.append(row)
 
-        index_cols = ["benchmark", "suite"] + info_cols + measurement_info_cols
+        index_cols = ["benchmark", "suite", "run"] + info_cols + ["lower_is_better"]
 
         df = pd.DataFrame(rows)
         if pivoted:
@@ -845,32 +840,49 @@ def execution_result_from_json(text: str) -> ExecutionResult:
 
 
 def _execution_result_to_dict(result: ExecutionResult) -> dict:
+    # Group measurements by execution object to avoid repeating execution data
+    grouped: dict[int, tuple[Execution, list[Measurement]]] = {}
+    order: list[int] = []
+    for m in result.measurements:
+        key = id(m.execution)
+        if key not in grouped:
+            grouped[key] = (m.execution, [])
+            order.append(key)
+        grouped[key][1].append(m)
+
     return {
-        "measurements": [
+        "executions": [
             {
-                "metric": m.metric,
-                "value": m.value,
-                "unit": m.unit,
-                "measurement_info": m.measurement_info,
-                "execution": {
-                    "benchmark_name": m.execution.benchmark_name,
-                    "suite": m.execution.suite,
-                    "command": m.execution.command,
-                    "working_directory": str(m.execution.working_directory),
-                    "env": m.execution.env,
-                    "timeout": m.execution.timeout,
-                    "info": m.execution.info,
-                },
+                "benchmark_name": exc.benchmark_name,
+                "suite": exc.suite,
+                "command": exc.command,
+                "working_directory": str(exc.working_directory),
+                "env": exc.env,
+                "timeout": exc.timeout,
+                "info": exc.info,
+                "run": exc.run,
+                "measurements": [
+                    {
+                        "metric": m.metric,
+                        "value": m.value,
+                        **({"unit": m.unit} if m.unit else {}),
+                        **(
+                            {"lower_is_better": m.lower_is_better}
+                            if m.lower_is_better is not None
+                            else {}
+                        ),
+                    }
+                    for m in measurements
+                ],
             }
-            for m in result.measurements
+            for exc, measurements in (grouped[k] for k in order)
         ]
     }
 
 
 def _dict_to_execution_result(d: dict) -> ExecutionResult:
     measurements: list[Measurement] = []
-    for md in d["measurements"]:
-        ed = md["execution"]
+    for ed in d["executions"]:
         execution = Execution(
             benchmark_name=ed["benchmark_name"],
             suite=ed["suite"],
@@ -880,16 +892,18 @@ def _dict_to_execution_result(d: dict) -> ExecutionResult:
             env=ed["env"],
             timeout=ed["timeout"],
             info=ed["info"],
+            run=ed.get("run", 1),
         )
-        measurements.append(
-            Measurement(
-                execution=execution,
-                metric=md["metric"],
-                value=md["value"],
-                unit=md["unit"],
-                measurement_info=md["measurement_info"],
+        for md in ed["measurements"]:
+            measurements.append(
+                Measurement(
+                    execution=execution,
+                    metric=md["metric"],
+                    value=md["value"],
+                    unit=md.get("unit", ""),
+                    lower_is_better=md.get("lower_is_better"),
+                )
             )
-        )
     return ExecutionResult(measurements=measurements)
 
 
@@ -937,7 +951,7 @@ VariantInfo = tuple[tuple[str, str], ...]
 
 def _variant_info_of(execution: "Execution") -> VariantInfo:
     """Build the `VariantInfo` identity from an execution's info dict."""
-    return tuple(sorted((k, v) for k, v in execution.info.items() if k != "run"))
+    return tuple(sorted(execution.info.items()))
 
 
 @dataclass
@@ -977,7 +991,9 @@ class GroupedResult:
 
     name: str  # display label (e.g. JSON filename stem, or "current")
     benchmarks: list[BenchmarkGroup]  # one entry per unique benchmark variant
-    kinds: dict[MetricKey, str]  # "LIB" = lower is better, "HIB" = higher is better
+    # Per-metric direction: True = lower is better, False = higher is better.
+    # Metrics absent from this map are not comparable.
+    lower_is_better: dict[MetricKey, bool]
 
 
 def _group_execution_result(result: ExecutionResult, name: str) -> GroupedResult:
@@ -985,15 +1001,15 @@ def _group_execution_result(result: ExecutionResult, name: str) -> GroupedResult
     Reshape an ExecutionResult into a GroupedResult for comparison/summary.
 
     Groups measurements by (suite, benchmark, info-minus-run), folds the
-    meta-metric "failed" into run counts, and collects per-metric "kind"
-    annotations ("LIB"/"HIB").
+    meta-metric "failed" into run counts, and collects per-metric
+    `lower_is_better` annotations.
     """
     # Scratch buckets keyed by (suite, benchmark, non_run_info)
     variant_order: list[tuple] = []
     variant_metrics: dict[tuple, dict[MetricKey, list[float]]] = {}
-    variant_runs: dict[tuple, set[str]] = {}  # observed "run" info values
+    variant_runs: dict[tuple, set[int]] = {}  # observed "run" info values
     variant_fails: dict[tuple, int] = {}
-    kinds: dict[MetricKey, str] = {}
+    lower_is_better: dict[MetricKey, bool] = {}
 
     def remember(identity: tuple) -> None:
         if identity not in variant_metrics:
@@ -1005,9 +1021,7 @@ def _group_execution_result(result: ExecutionResult, name: str) -> GroupedResult
         identity = (m.execution.suite, m.execution.benchmark_name, variant_info)
         remember(identity)
 
-        run_val = m.execution.info.get("run")
-        if run_val is not None:
-            variant_runs.setdefault(identity, set()).add(run_val)
+        variant_runs.setdefault(identity, set()).add(m.execution.run)
 
         if m.metric == "failed" and m.value == 1:
             variant_fails[identity] = variant_fails.get(identity, 0) + 1
@@ -1016,9 +1030,8 @@ def _group_execution_result(result: ExecutionResult, name: str) -> GroupedResult
             continue
 
         metric_key = (m.metric, m.unit)
-        kind_val = m.measurement_info.get("kind", "")
-        if kind_val:
-            kinds[metric_key] = kind_val
+        if m.lower_is_better is not None:
+            lower_is_better[metric_key] = m.lower_is_better
 
         per_variant = variant_metrics[identity]
         per_variant.setdefault(metric_key, []).append(m.value)
@@ -1041,7 +1054,9 @@ def _group_execution_result(result: ExecutionResult, name: str) -> GroupedResult
             )
         )
 
-    return GroupedResult(name=name, benchmarks=benchmarks, kinds=kinds)
+    return GroupedResult(
+        name=name, benchmarks=benchmarks, lower_is_better=lower_is_better
+    )
 
 
 # --------------------------------------
@@ -1063,10 +1078,13 @@ class ResultParser(abc.ABC):
         """
         return IgnoreFailParserDecorator(self)
 
-    def kind(
-        self, measure_kind: "MeasurementKindParserDecorator.Kind"
-    ) -> "ResultParser":
-        return MeasurementKindParserDecorator(self, measure_kind)
+    def lower_is_better(self) -> "ResultParser":
+        """Tag every parsed measurement as a lower-is-better metric."""
+        return DirectionParserDecorator(self, lower_is_better=True)
+
+    def higher_is_better(self) -> "ResultParser":
+        """Tag every parsed measurement as a higher-is-better metric."""
+        return DirectionParserDecorator(self, lower_is_better=False)
 
     def __and__(self, other) -> "ResultParser":
         return MixedResultParser(self, other)
@@ -1110,9 +1128,11 @@ class PlainFloatParser(ResultParser):
     """
 
     unit: str
+    metric: str
 
-    def __init__(self, unit: str) -> None:
+    def __init__(self, unit: str, metric: str = "runtime") -> None:
         self.unit = unit
+        self.metric = metric
 
     def parse(self, process_result: ProcessResult) -> ExecutionResult:
         if isinstance(process_result, FailedProcessResult):
@@ -1122,9 +1142,14 @@ class PlainFloatParser(ResultParser):
 
         for line in process_result.stdout.split("\n"):
             try:
-                time = float(line)
+                value = float(line)
                 result.measurements.append(
-                    Measurement.runtime(process_result.execution, time, self.unit)
+                    Measurement(
+                        execution=process_result.execution,
+                        metric=self.metric,
+                        value=value,
+                        unit=self.unit,
+                    )
                 )
             except ValueError:
                 pass
@@ -1132,35 +1157,46 @@ class PlainFloatParser(ResultParser):
         return result
 
 
-class LastLineParser(ResultParser):
+class LineParser(ResultParser):
     """
-    Only parse the last non-empty line of succesful runs
+    Extract a single non-empty line from stdout/stderr and pass it to a subparser.
+
+    The line parameter selects which non-empty line to extract:
+    - Positive values are 1-based from the top (1 = first, 2 = second, ...)
+    - Negative values index from the bottom (-1 = last, -2 = second to last, ...)
+    - 0 is forbidden
     """
 
     subparser: ResultParser
+    line: int
 
-    def __init__(self, subparser: ResultParser) -> None:
+    def __init__(self, subparser: ResultParser, line: int = -1) -> None:
+        if line == 0:
+            raise ValueError(
+                "line must be non-zero (positive from top, negative from bottom)"
+            )
         self.subparser = subparser
+        self.line = line
+
+    @staticmethod
+    def _select_line(text: str, line: int) -> str:
+        lines = [l for l in text.split("\n") if l.strip() != ""]
+        try:
+            # Convert 1-based positive index to 0-based
+            idx = line - 1 if line > 0 else line
+            return lines[idx]
+        except IndexError:
+            return ""
 
     def parse(self, process_result: ProcessResult) -> ExecutionResult:
         if isinstance(process_result, FailedProcessResult):
             return ExecutionResult()
 
-        stdout_line = ""
-        for stdout_line in reversed(process_result.stdout.split("\n")):
-            if stdout_line.strip() != "":
-                break
-
-        stderr_line = ""
-        for stderr_line in reversed(process_result.stderr.split("\n")):
-            if stderr_line.strip() != "":
-                break
-
         return self.subparser.parse(
             dataclasses.replace(
                 process_result,
-                stdout=stdout_line,
-                stderr=stderr_line,
+                stdout=self._select_line(process_result.stdout, self.line),
+                stderr=self._select_line(process_result.stderr, self.line),
             )
         )
 
@@ -1215,8 +1251,6 @@ class RegexParser(ResultParser):
             return ExecutionResult()
 
         result = ExecutionResult()
-        iteration = 1
-
         if self.output == "stdout":
             outputs = [process_result.stdout]
         elif self.output == "stderr":
@@ -1232,12 +1266,6 @@ class RegexParser(ResultParser):
                 pos = match.end()
                 value = self.process(match.group(self.match_group))
 
-                if self.iterations:
-                    info = {"iteration": str(iteration)}
-                    iteration += 1
-                else:
-                    info = {}
-
                 if self.unit_match_group is not None:
                     unit = match.group(self.unit_match_group)
                 elif self.unit is not None:
@@ -1251,7 +1279,6 @@ class RegexParser(ResultParser):
                         self.metric,
                         value,
                         unit,
-                        info,
                     )
                 )
 
@@ -1295,7 +1322,6 @@ class RebenchParser(ResultParser):
             return ExecutionResult()
 
         result = ExecutionResult()
-        iteration = 0
 
         for line in process_result.stdout.split("\n"):
             match = self.re_log_line.match(line)
@@ -1316,10 +1342,8 @@ class RebenchParser(ResultParser):
                         "runtime",
                         time,
                         "ms",
-                        {"iteration": str(iteration)},
                     )
                 )
-                iteration += 1
                 continue
 
             match = self.re_extra_criterion_log_line.match(line)
@@ -1336,38 +1360,11 @@ class RebenchParser(ResultParser):
                         criterion,
                         value,
                         unit,
-                        {"iteration": str(iteration)},
                     )
                 )
-
-                # Force new iteration
-                if criterion == "total":
-                    iteration += 1
                 continue
 
         return result
-
-
-class ClockTimeParser(ResultParser):
-    """
-    Capture the outer runtime of a process
-    """
-
-    def parse(self, process_result: ProcessResult) -> ExecutionResult:
-        if process_result.runtime is None:
-            return ExecutionResult()
-
-        return ExecutionResult(
-            [
-                Measurement(
-                    execution=process_result.execution,
-                    metric="clock_time",
-                    value=process_result.runtime,
-                    unit="s",
-                    measurement_info={},
-                )
-            ]
-        )
 
 
 class SingleResourceUsageParser(ResultParser):
@@ -1416,53 +1413,71 @@ class SingleResourceUsageParser(ResultParser):
                     metric=self.metric,
                     value=value,
                     unit=self.unit,
-                    measurement_info={},
                 )
             ]
         )
 
 
-def ResourceUsageParser(*columns: ResourceMetric) -> ResultParser:
+def MaxRssParser() -> ResultParser:
+    return SingleResourceUsageParser("ru_maxrss", "max_rss", "kB")
+
+
+class TimeParser(ResultParser):
     """
-    Create a parser for resourece metrics
+    Emit up to three time measurements (in seconds): "elapsed" (wall clock,
+    from process_result.runtime), "user" (rusage.ru_utime), and
+    "system" (rusage.ru_stime). At least one flag must be true.
     """
-    parsers = []
 
-    for col in columns:
-        if col == "max_rss":
-            parsers.append(
-                SingleResourceUsageParser(
-                    "ru_maxrss",
-                    "max_rss",
-                    "kB",
+    elapsed: bool
+    system: bool
+    user: bool
+
+    def __init__(
+        self, elapsed: bool = True, system: bool = False, user: bool = False
+    ) -> None:
+        if not (elapsed or system or user):
+            raise ValueError(
+                "TimeParser requires at least one of elapsed, system, user to be True"
+            )
+        self.elapsed = elapsed
+        self.system = system
+        self.user = user
+
+    def parse(self, process_result: ProcessResult) -> ExecutionResult:
+        measurements: list[Measurement] = []
+
+        if self.elapsed and process_result.runtime is not None:
+            measurements.append(
+                Measurement(
+                    execution=process_result.execution,
+                    metric="elapsed",
+                    value=process_result.runtime,
+                    unit="s",
                 )
             )
 
-        elif col == "user_time":
-            parsers.append(
-                SingleResourceUsageParser(
-                    "ru_utime",
-                    "user_time",
-                    "s",
+        if process_result.rusage is not None:
+            if self.user:
+                measurements.append(
+                    Measurement(
+                        execution=process_result.execution,
+                        metric="user",
+                        value=process_result.rusage.ru_utime,
+                        unit="s",
+                    )
                 )
-            )
-
-        elif col == "system_time":
-            parsers.append(
-                SingleResourceUsageParser(
-                    "ru_stime",
-                    "system_time",
-                    "s",
+            if self.system:
+                measurements.append(
+                    Measurement(
+                        execution=process_result.execution,
+                        metric="system",
+                        value=process_result.rusage.ru_stime,
+                        unit="s",
+                    )
                 )
-            )
 
-        else:
-            raise ValueError(f"Unknown resource metric column {col}")
-
-    if len(parsers) == 1:
-        return parsers[0]
-
-    return MixedResultParser(*parsers)
+        return ExecutionResult(measurements)
 
 
 class FailedParser(ResultParser):
@@ -1473,8 +1488,6 @@ class FailedParser(ResultParser):
                     execution=process_result.execution,
                     metric="failed",
                     value=1 if isinstance(process_result, FailedProcessResult) else 0,
-                    unit="",
-                    measurement_info={},
                 )
             ]
         )
@@ -1504,21 +1517,19 @@ class IgnoreFailParserDecorator(ResultParser):
         return self.subparser.parse(process_result)
 
 
-class MeasurementKindParserDecorator(ResultParser):
-    Kind = Literal["LIB", "HIB"]  # Lower / Higher is Better
-
+class DirectionParserDecorator(ResultParser):
     subparser: ResultParser
-    measure_kind: Kind
+    _lib: bool  # True = lower is better, False = higher is better
 
-    def __init__(self, subparser: ResultParser, measure_kind: Kind) -> None:
+    def __init__(self, subparser: ResultParser, lower_is_better: bool) -> None:
         self.subparser = subparser
-        self.measure_kind = measure_kind
+        self._lib = lower_is_better
 
     def parse(self, process_result: ProcessResult) -> ExecutionResult:
         result = self.subparser.parse(process_result)
 
         for m in result.measurements:
-            m.measurement_info["kind"] = self.measure_kind
+            m.lower_is_better = self._lib
 
         return result
 
@@ -1607,9 +1618,8 @@ class CsvReporter(Reporter):
     """
     Report into CSV file. Streams rows to disk as executions finish.
 
-    The header schema (info + measurement_info columns) is fixed from the
-    first reported result; subsequent measurements are written using that
-    same schema.
+    The header schema (info columns) is fixed from the first reported result;
+    subsequent measurements are written using that same schema.
     """
 
     filepath: Path
@@ -1620,7 +1630,6 @@ class CsvReporter(Reporter):
         self.separator = separator
         self._file = None
         self._info_cols: Optional[list[str]] = None
-        self._measurement_info_cols: Optional[list[str]] = None
 
     @staticmethod
     def escape_text(text: str) -> str:
@@ -1636,7 +1645,6 @@ class CsvReporter(Reporter):
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         self._file = open(self.filepath, "wt")
         self._info_cols = None
-        self._measurement_info_cols = None
 
     def report(self, process_result: ProcessResult, parsed: ExecutionResult):
         if self._file is None:
@@ -1646,30 +1654,25 @@ class CsvReporter(Reporter):
 
         if self._info_cols is None:
             self._info_cols = parsed.info_columns()
-            self._measurement_info_cols = parsed.measurement_info_columns()
             columns = (
-                ["benchmark", "suite"]
+                ["benchmark", "suite", "run"]
                 + self._info_cols
-                + self._measurement_info_cols
-                + ["metric", "value", "unit"]
+                + ["lower_is_better", "metric", "value", "unit"]
             )
             self._file.write(self.format_line(columns))
-
-        assert self._measurement_info_cols is not None
 
         for measure in parsed.measurements:
             line: list[str] = [
                 measure.execution.benchmark_name,
                 measure.execution.suite,
+                str(measure.execution.run),
             ]
 
             for col in self._info_cols:
                 line.append(measure.execution.info.get(col, ""))
 
-            for col in self._measurement_info_cols:
-                line.append(measure.measurement_info.get(col, ""))
-
-            line += [measure.metric, str(measure.value), measure.unit]
+            lib_str = "" if measure.lower_is_better is None else str(measure.lower_is_better)
+            line += [lib_str, measure.metric, str(measure.value), measure.unit]
 
             self._file.write(self.format_line(line))
 
@@ -1719,13 +1722,16 @@ class TableReporter(Reporter):
 
     def print_result(self, result: ExecutionResult):
         info_cols = result.info_columns()
-        measurement_info_cols = result.measurement_info_columns()
+
+        def lib_str(m: Measurement) -> str:
+            return "" if m.lower_is_better is None else str(m.lower_is_better)
 
         # Measure widths
         benchmark_col_w = len("benchmark")
         suite_col_w = len("suite")
+        run_w = len("run")
         info_cols_w = {info: len(info) for info in info_cols}
-        measurement_info_w = {info: len(info) for info in measurement_info_cols}
+        lib_w = len("lower_is_better")
         metric_w = len("metric")
         value_w = len("value")
         unit_w = len("unit")
@@ -1735,17 +1741,14 @@ class TableReporter(Reporter):
                 len(measure.execution.benchmark_name), benchmark_col_w
             )
             suite_col_w = max(len(measure.execution.suite), suite_col_w)
+            run_w = max(len(str(measure.execution.run)), run_w)
 
             for i in info_cols:
                 info_cols_w[i] = max(
                     len(measure.execution.info.get(i, "")), info_cols_w[i]
                 )
 
-            for i in measurement_info_cols:
-                measurement_info_w[i] = max(
-                    len(measure.measurement_info.get(i, "")), measurement_info_w[i]
-                )
-
+            lib_w = max(len(lib_str(measure)), lib_w)
             metric_w = max(len(measure.metric), metric_w)
             value_w = max(len(str(measure.value)), value_w)
             unit_w = max(len(measure.unit), unit_w)
@@ -1755,10 +1758,10 @@ class TableReporter(Reporter):
             [
                 benchmark_col_w + 2,
                 suite_col_w + 2,
+                run_w + 2,
                 sum(info_cols_w.values()),
                 len(info_cols_w) * 2,
-                sum(measurement_info_w.values()),
-                len(measurement_info_w) * 2,
+                lib_w + 2,
                 metric_w + 2,
                 value_w + 2,
                 unit_w,
@@ -1768,13 +1771,12 @@ class TableReporter(Reporter):
         print("\n" + "-" * sep_size)
         print("benchmark".ljust(benchmark_col_w + 2), end="")
         print("suite".ljust(suite_col_w + 2), end="")
+        print("run".ljust(run_w + 2), end="")
 
         for i in info_cols:
             print(i.ljust(info_cols_w[i] + 2), end="")
 
-        for i in measurement_info_cols:
-            print(i.ljust(measurement_info_w[i] + 2), end="")
-
+        print("lower_is_better".ljust(lib_w + 2), end="")
         print("metric".ljust(metric_w + 2), end="")
         print("value".ljust(value_w + 2), end="")
         print("unit".ljust(unit_w), end="")
@@ -1784,6 +1786,7 @@ class TableReporter(Reporter):
         for measure in result.measurements:
             print(measure.execution.benchmark_name.ljust(benchmark_col_w + 2), end="")
             print(measure.execution.suite.ljust(suite_col_w + 2), end="")
+            print(str(measure.execution.run).ljust(run_w + 2), end="")
 
             for i in info_cols:
                 print(
@@ -1793,17 +1796,10 @@ class TableReporter(Reporter):
                     end="",
                 )
 
-            for i in measurement_info_cols:
-                print(
-                    measure.measurement_info.get(i, "").ljust(
-                        measurement_info_w[i] + 2,
-                    ),
-                    end="",
-                )
-
+            print(lib_str(measure).ljust(lib_w + 2), end="")
             print(measure.metric.ljust(metric_w + 2), end="")
             print(str(measure.value).ljust(value_w + 2), end="")
-            print(measure.unit.ljust(unit_w + 2), end="")
+            print((measure.unit).ljust(unit_w + 2), end="")
             print()
 
         print("-" * sep_size)
@@ -1876,9 +1872,7 @@ class SummaryReporter(Reporter):
 
         multi_run = total_runs > 1
         suffix = " (mean \u00b1 \u03c3):" if multi_run else ":"
-        labels = {
-            k: f"{k[0]} [{scaled_info[k][1]}]{suffix}" for k in group.metrics
-        }
+        labels = {k: f"{k[0]} [{scaled_info[k][1]}]{suffix}" for k in group.metrics}
         max_label_w = max(len(l) for l in labels.values())
 
         for metric_key, values in group.metrics.items():
@@ -1932,12 +1926,13 @@ class DirReporter(Reporter):
     def report(self, process_result: ProcessResult, parsed: ExecutionResult):
         pr = process_result
         exe = pr.execution
-        run_id = self._run_ids.get(id(exe), 1)
+        run_id = self._run_ids.get(id(exe), exe.run)
         run_dir = self.output_dir / exe.suite / exe.benchmark_name / str(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
         # seq: cwd, command, then info k=v lines
         seq_lines = [str(exe.working_directory), " ".join(exe.command)]
+        seq_lines.append(f"run={exe.run}")
         seq_lines.extend(f"{k}={v}" for k, v in exe.info.items())
         (run_dir / "seq").write_text("\n".join(seq_lines) + "\n")
 
@@ -1995,9 +1990,9 @@ def compare_and_print(datasets: list[GroupedResult]):
 
     other_indices = [(ds, _index(ds)) for ds in others]
 
-    all_kinds: dict[MetricKey, str] = {}
+    all_lower_is_better: dict[MetricKey, bool] = {}
     for ds in datasets:
-        all_kinds.update(ds.kinds)
+        all_lower_is_better.update(ds.lower_is_better)
 
     def compare_pair(
         bl_center: float,
@@ -2044,14 +2039,18 @@ def compare_and_print(datasets: list[GroupedResult]):
         baseline_name: str,
     ) -> str:
         err_str = f" \u00b1 {sigma:.2f}" if sigma > 0 else ""
+        word_color = TUI.GREEN if word == "better" else TUI.RED
+        word_str = f"{word_color}{TUI.BOLD}{word}{TUI.RESET}"
         return (
             f"{indent}{TUI.MAGENTA}{name}{TUI.RESET} was"
             f" {TUI.GREEN}{TUI.BOLD}{ratio:.2f}{TUI.RESET}{err_str}"
-            f" times {word} than {TUI.GREEN}{TUI.BOLD}{baseline_name}{TUI.RESET}"
+            f" times {word_str} than {TUI.GREEN}{TUI.BOLD}{baseline_name}{TUI.RESET}"
         )
 
     def format_runs(name: str, rc: BenchmarkRunCounts) -> str:
-        return f"{name} ({rc.failures}/{rc.successes})"
+        f_s = f"{TUI.RED}{rc.failures}{TUI.RESET}" if rc.failures else str(rc.failures)
+        s_s = f"{TUI.GREEN}{rc.successes}{TUI.RESET}"
+        return f"{name}: {f_s} failed / {s_s} succeeded"
 
     # Per-benchmark comparison (baseline identities only)
     print()
@@ -2081,9 +2080,10 @@ def compare_and_print(datasets: list[GroupedResult]):
             print(f"    {format_runs(ds.name, other_group.run_counts)}")
 
         for metric_key, bl_vals in bl_group.metrics.items():
+            if metric_key not in all_lower_is_better:
+                continue
             metric, unit = metric_key
-            kind = all_kinds.get(metric_key, "LIB")
-            lower_is_better = kind != "HIB"
+            lower_is_better = all_lower_is_better[metric_key]
 
             bl_c = center(bl_vals)
             bl_sd = stdev(bl_vals)
@@ -2159,9 +2159,10 @@ def compare_and_print(datasets: list[GroupedResult]):
                     suite_metric_keys.append(mk)
 
         for metric_key in suite_metric_keys:
+            if metric_key not in all_lower_is_better:
+                continue
             metric, unit = metric_key
-            kind = all_kinds.get(metric_key, "LIB")
-            lower_is_better = kind != "HIB"
+            lower_is_better = all_lower_is_better[metric_key]
 
             metric_printed = False
             for ds, idx in other_indices:
@@ -2713,7 +2714,6 @@ __all__ = [
     "ProcessResult",
     "SuccesfulProcessResult",
     "FailedProcessResult",
-    "ResourceMetric",
     # Input definitions
     "Execution",
     "Benchmark",
@@ -2744,16 +2744,16 @@ __all__ = [
     "ResultParser",
     "MixedResultParser",
     "PlainFloatParser",
-    "LastLineParser",
+    "LineParser",
     "RegexParser",
     "RebenchParser",
-    "ClockTimeParser",
     "SingleResourceUsageParser",
-    "ResourceUsageParser",
+    "MaxRssParser",
+    "TimeParser",
     "FailedParser",
     # Parser decorators
     "IgnoreFailParserDecorator",
-    "MeasurementKindParserDecorator",
+    "DirectionParserDecorator",
     # Reporters
     "Reporter",
     "MixedReporter",

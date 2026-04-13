@@ -1,35 +1,6 @@
 from benchr import *
 
 
-class ZooBatchParser(ResultParser):
-    def parse(self, process_result: ProcessResult) -> ExecutionResult:
-        # The second number is the throughput, first is sum and third is time, always ~10s
-        if isinstance(process_result, SuccesfulProcessResult):
-            sum_seen = False
-            for line in process_result.stdout.split("\n"):
-                try:
-                    value = float(line)
-                    if sum_seen:
-                        return ExecutionResult(
-                            [
-                                Measurement(
-                                    execution=process_result.execution,
-                                    metric="throughput",
-                                    value=value,
-                                    unit="iter",
-                                    measurement_info={},
-                                )
-                            ]
-                        )
-                    else:
-                        sum_seen = True
-
-                except ValueError:
-                    pass
-
-        return ExecutionResult()
-
-
 conf = (
     Config(
         [
@@ -42,10 +13,10 @@ conf = (
                     )
                 ),
                 parser=(
-                    LastLineParser(PlainFloatParser("s"))
-                    & ResourceUsageParser("max_rss")
-                    & ClockTimeParser()
-                ).kind("LIB")  # All of them are less is better
+                    LineParser(PlainFloatParser("s"))
+                    & MaxRssParser()
+                    & TimeParser()
+                ).lower_is_better()  # All of them are less is better
                 & FailedParser(),
             ).timeout(20),
             suite(
@@ -53,7 +24,7 @@ conf = (
                 benchmarks=lambda ps: [
                     B("zoo_batch", path=ps.cwd / "benchmarks" / "zoo_batch.lox")
                 ],
-                parser=ZooBatchParser().kind("HIB") & FailedParser(),
+                parser=LineParser(PlainFloatParser("iter", metric="throughput"), line=2).higher_is_better() & FailedParser(),
             ).timeout(12),
         ]
     )
