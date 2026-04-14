@@ -1,3 +1,4 @@
+from subprocess import CompletedProcess
 from benchr import *
 
 
@@ -13,9 +14,7 @@ conf = (
                     )
                 ),
                 parser=(
-                    LineParser(PlainFloatParser("s"))
-                    & MaxRssParser()
-                    & TimeParser()
+                    LineParser(PlainFloatParser("s")) & MaxRssParser() & TimeParser()
                 ).lower_is_better()  # All of them are less is better
                 & FailedParser(),
             ).timeout(20),
@@ -24,7 +23,10 @@ conf = (
                 benchmarks=lambda ps: [
                     B("zoo_batch", path=ps.cwd / "benchmarks" / "zoo_batch.lox")
                 ],
-                parser=LineParser(PlainFloatParser("iter", metric="throughput"), line=2).higher_is_better() & FailedParser(),
+                parser=LineParser(
+                    PlainFloatParser("iter", metric="throughput"), line=2
+                ).higher_is_better()
+                & FailedParser(),
             ).timeout(12),
         ]
     )
@@ -43,4 +45,5 @@ if __name__ == "__main__":
         conf,
         ["lox"],
         {"cwd": Path(__file__).parent},
+        reporter=SummaryReporter(formatter=CompactFormatter("runtime")),
     )

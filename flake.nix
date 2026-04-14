@@ -24,9 +24,15 @@
             (python3.withPackages (
               ps: with ps; [
                 pandas
+                tabulate
+                pytest
               ]
             ))
+            uv
           ];
+          shellHook = ''
+            export PYTHONPATH="$PWD/src:$PYTHONPATH"
+          '';
         };
       }
     );

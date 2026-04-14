@@ -73,7 +73,7 @@ def rcp_main():
                         "--args",
                     ]
                     + ["--output-dir", str(output)]
-                    + ["--runs", str(executions)]
+                    + ["--runs", str(runs)]
                     + ["--rcp"]
                     + [str(benchmark.keys.path.with_suffix(""))]
                 ),
@@ -90,11 +90,11 @@ def rcp_main():
 
         if parallel > 1:
             executor = ParallelExecutor(
-                parallel, output / "crash", CsvReporter(output / "result.csv")
+                parallel, CsvReporter(output / "result.csv")
             )
         else:
             executor = DefaultExecutor(
-                output / "crash", CsvReporter(output / "result.csv")
+                CsvReporter(output / "result.csv")
             )
 
         with executor:
