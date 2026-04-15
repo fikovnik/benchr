@@ -84,6 +84,6 @@ def test_benchmark_from_folder(tmp_path):
     assert len(names) == 3
     assert "a" in names
     assert "b" in names
-    assert "d" in names
+    assert "sub/d" in names
     # .txt file should be excluded
     assert "c" not in names

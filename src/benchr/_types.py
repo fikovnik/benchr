@@ -197,13 +197,17 @@ class Benchmark:
     def from_folder(folder: Path, extension: Optional[str] = None) -> list["Benchmark"]:
         """
         Recursively walk the given folder, collecting all files with the given
-        extension (or all if no extension is given) into Benchmarks
+        extension (or all if no extension is given) into Benchmarks.
+        The benchmark name is the path relative to `folder` without extension,
+        e.g. for folder="tests" and file="tests/assignment/global.lox" the
+        name will be "assignment/global".
         """
         res = []
         for path, _, files in folder.walk():
             for file in files:
                 p = path / file
                 if extension is None or p.suffix.lower() == ("." + extension.lower()):
-                    res.append(p)
+                    name = str(p.relative_to(folder).with_suffix(""))
+                    res.append(Benchmark(name, path=p))
 
-        return Benchmark.from_files(*res)
+        return res
