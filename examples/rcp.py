@@ -52,7 +52,7 @@ def rcp_main():
 
         benchmarks = [
             b
-            for b in Benchmark.from_folder(bench_dir, extension="R")
+            for b in Benchmark.from_files(bench_dir, pattern=r"\.R$")
             if b.keys.path.parent != bench_dir  # Only files recursed inside
             and (path_filter == "" or path_filter not in str(b.keys.path))
         ]

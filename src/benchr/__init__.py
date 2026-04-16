@@ -57,7 +57,8 @@ from benchr._parsers import (
     DirectionParserDecorator,
 )
 from benchr._output import (
-    TUI,
+    console,
+    err_console,
     Reporter,
     MixedReporter,
     CsvReporter,
@@ -139,6 +140,9 @@ __all__ = [
     # Parser decorators
     "IgnoreFailParserDecorator",
     "DirectionParserDecorator",
+    # Console
+    "console",
+    "err_console",
     # Reporters
     "Reporter",
     "MixedReporter",

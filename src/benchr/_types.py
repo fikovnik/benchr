@@ -1,5 +1,6 @@
 import argparse
 import dataclasses
+import re
 import resource
 from dataclasses import dataclass
 from pathlib import Path
@@ -180,34 +181,40 @@ class Benchmark:
         self.keys = SimpleNamespace(keys)
 
     @staticmethod
-    def from_files(*files: Path) -> list["Benchmark"]:
+    def from_files(
+        *paths: Path,
+        recursive: bool = True,
+        pattern: str | None = None,
+    ) -> list["Benchmark"]:
         """
-        Create benchmarks from Path, where the name will be the filename
-        without extension, and `keys.path` is the full given path
-        """
-        return [
-            Benchmark(
-                file.stem,
-                path=file,
-            )
-            for file in files
-        ]
+        Create benchmarks from files and/or directories.
 
-    @staticmethod
-    def from_folder(folder: Path, extension: Optional[str] = None) -> list["Benchmark"]:
-        """
-        Recursively walk the given folder, collecting all files with the given
-        extension (or all if no extension is given) into Benchmarks.
-        The benchmark name is the path relative to `folder` without extension,
-        e.g. for folder="tests" and file="tests/assignment/global.lox" the
-        name will be "assignment/global".
-        """
-        res = []
-        for path, _, files in folder.walk():
-            for file in files:
-                p = path / file
-                if extension is None or p.suffix.lower() == ("." + extension.lower()):
-                    name = str(p.relative_to(folder).with_suffix(""))
-                    res.append(Benchmark(name, path=p))
+        For files, the benchmark name is the filename without extension.
+        For directories, files are collected (recursively if *recursive* is
+        True) and the benchmark name is the path relative to that directory
+        without extension, e.g. for dir="tests" and file
+        "tests/assignment/global.lox" the name will be "assignment/global".
 
+        *pattern* is an optional regex matched against the filename
+        (``re.search``); only matching files are included.
+        """
+        compiled = re.compile(pattern) if pattern is not None else None
+        res: list["Benchmark"] = []
+        for p in paths:
+            if p.is_dir():
+                if recursive:
+                    entries = (
+                        dirpath / fname
+                        for dirpath, _, fnames in p.walk()
+                        for fname in fnames
+                    )
+                else:
+                    entries = (child for child in p.iterdir() if child.is_file())
+                for fp in entries:
+                    if compiled is None or compiled.search(fp.name):
+                        name = str(fp.relative_to(p).with_suffix(""))
+                        res.append(Benchmark(name, path=fp))
+            else:
+                if compiled is None or compiled.search(p.name):
+                    res.append(Benchmark(p.stem, path=p))
         return res

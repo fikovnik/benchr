@@ -16,7 +16,9 @@ from pprint import pprint
 from threading import Lock
 from typing import Any, Callable, Optional
 
-from tabulate import tabulate as tabulate_fn
+from rich.console import Console
+from rich.table import Table
+from rich.theme import Theme
 
 from benchr._types import (
     const,
@@ -53,29 +55,24 @@ from benchr._results import (
 from benchr._parsers import ResultParser
 
 
-class TUI:
-    if sys.stdout.isatty():
-        RESET = "\033[0m"
-        BOLD = "\033[1m"
-        BLACK = "\033[30m"
-        RED = "\033[31m"
-        GREEN = "\033[32m"
-        YELLOW = "\033[33m"
-        BLUE = "\033[34m"
-        MAGENTA = "\033[35m"
-        CYAN = "\033[36m"
-        WHITE = "\033[37m"
-    else:
-        RESET = ""
-        BOLD = ""
-        BLACK = ""
-        RED = ""
-        GREEN = ""
-        YELLOW = ""
-        BLUE = ""
-        MAGENTA = ""
-        CYAN = ""
-        WHITE = ""
+# Centralized style definitions — change colors in one place
+BENCHR_THEME = Theme({
+    "benchr.success": "green",
+    "benchr.failure": "red",
+    "benchr.metric": "cyan",
+    "benchr.value": "green bold",
+    "benchr.min": "cyan",
+    "benchr.max": "magenta",
+    "benchr.name": "magenta",
+    "benchr.label": "bold",
+    "benchr.better": "green bold",
+    "benchr.worse": "red bold",
+    "benchr.progress": "blue bold",
+    "benchr.in_process": "magenta bold",
+})
+
+console = Console(theme=BENCHR_THEME, highlight=False)
+err_console = Console(theme=BENCHR_THEME, highlight=False, stderr=True)
 
 
 class Reporter(abc.ABC):
@@ -240,8 +237,13 @@ class TableReporter(Reporter):
             row += [lib_str(m), m.metric, str(m.value), m.unit]
             rows.append(row)
 
-        print()
-        print(tabulate_fn(rows, headers=headers, tablefmt="simple"))
+        table = Table(show_header=True, show_edge=False, pad_edge=False)
+        for h in headers:
+            table.add_column(h)
+        for row in rows:
+            table.add_row(*[str(c) for c in row])
+        console.print()
+        console.print(table)
 
 
 def _orient_ratio(display_ratio: float, sigma: float) -> tuple[float, float, str]:
@@ -285,9 +287,9 @@ class DefaultSummaryFormatter(SummaryFormatter):
         rc = gs.run_counts
         total_runs = (rc.failures + rc.successes) or 1
         run_word = "run" if total_runs == 1 else "runs"
-        f_s = f"{TUI.RED}{rc.failures}{TUI.RESET}" if rc.failures else str(rc.failures)
-        s_s = f"{TUI.GREEN}{rc.successes}{TUI.RESET}"
-        lines.append(f"{TUI.BOLD}{name}:{TUI.RESET} {f_s}/{s_s} {run_word}")
+        f_s = f"[benchr.failure]{rc.failures}[/]" if rc.failures else str(rc.failures)
+        s_s = f"[benchr.success]{rc.successes}[/]"
+        lines.append(f"[benchr.label]{name}:[/] {f_s}/{s_s} {run_word}")
 
         if not gs.metrics:
             return
@@ -298,7 +300,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
 
         multi_run = total_runs > 1
         suffix = " (mean \u00b1 \u03c3):" if multi_run else ":"
-        labels = {mk: f"{mk[0]} [{scaled_info[mk][1]}]{suffix}" for mk in gs.metrics}
+        labels = {mk: f"{mk[0]} \\[{scaled_info[mk][1]}]{suffix}" for mk in gs.metrics}
         max_label_w = max(len(l) for l in labels.values())
 
         for mk, ms in gs.metrics.items():
@@ -310,15 +312,15 @@ class DefaultSummaryFormatter(SummaryFormatter):
                 min_val = ms.min * scale
                 max_val = ms.max * scale
                 lines.append(
-                    f"  {TUI.BOLD}{label}{TUI.RESET}"
-                    f"  {TUI.GREEN}{TUI.BOLD}{mean_val:.2f}{TUI.RESET}"
-                    f" \u00b1 {TUI.GREEN}{stddev_val:.2f}{TUI.RESET}"
-                    f"    ({TUI.CYAN}{min_val:.2f}{TUI.RESET}"
-                    f" \u2026 {TUI.MAGENTA}{max_val:.2f}{TUI.RESET})"
+                    f"  [benchr.label]{label}[/]"
+                    f"  [benchr.value]{mean_val:.2f}[/]"
+                    f" \u00b1 [benchr.success]{stddev_val:.2f}[/]"
+                    f"    ([benchr.min]{min_val:.2f}[/]"
+                    f" \u2026 [benchr.max]{max_val:.2f}[/])"
                 )
             else:
                 lines.append(
-                    f"  {label}  {TUI.GREEN}{TUI.BOLD}{mean_val:.2f}{TUI.RESET}"
+                    f"  {label}  [benchr.value]{mean_val:.2f}[/]"
                 )
 
     @staticmethod
@@ -328,11 +330,11 @@ class DefaultSummaryFormatter(SummaryFormatter):
 
         def format_runs(name: str, rc: BenchmarkRunCounts) -> str:
             f_s = (
-                f"{TUI.RED}{rc.failures}{TUI.RESET}"
+                f"[benchr.failure]{rc.failures}[/]"
                 if rc.failures
                 else str(rc.failures)
             )
-            s_s = f"{TUI.GREEN}{rc.successes}{TUI.RESET}"
+            s_s = f"[benchr.success]{rc.successes}[/]"
             return f"{name}: {f_s} failed / {s_s} succeeded"
 
         def format_ratio_line(
@@ -344,13 +346,13 @@ class DefaultSummaryFormatter(SummaryFormatter):
             baseline_name: str,
         ) -> str:
             err_str = f" \u00b1 {sigma:.2f}" if sigma > 0 else ""
-            word_color = TUI.GREEN if word == "better" else TUI.RED
-            word_str = f"{word_color}{TUI.BOLD}{word}{TUI.RESET}"
+            word_style = "benchr.better" if word == "better" else "benchr.worse"
+            word_str = f"[{word_style}]{word}[/]"
             return (
-                f"{indent}{TUI.MAGENTA}{name}{TUI.RESET} was"
-                f" {TUI.GREEN}{TUI.BOLD}{ratio:.2f}{TUI.RESET}{err_str}"
+                f"{indent}[benchr.name]{name}[/] was"
+                f" [benchr.value]{ratio:.2f}[/]{err_str}"
                 f" times {word_str} than"
-                f" {TUI.GREEN}{TUI.BOLD}{baseline_name}{TUI.RESET}"
+                f" [benchr.value]{baseline_name}[/]"
             )
 
         all_lib: dict[MetricKey, bool] = {}
@@ -391,7 +393,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
             if bl_group.info:
                 info_str = ", ".join(f"{k}={v}" for k, v in bl_group.info)
                 name += f" ({info_str})"
-            lines.append(f"{TUI.BOLD}{name}:{TUI.RESET}")
+            lines.append(f"[benchr.label]{name}:[/]")
 
             lines.append("  runs:")
             lines.append(f"    {format_runs(baseline.name, bl_group.run_counts)}")
@@ -406,7 +408,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
                     if mr is None:
                         continue
                     if not metric_printed:
-                        lines.append(f"  {TUI.CYAN}{mk[0]}{TUI.RESET}:")
+                        lines.append(f"  [benchr.metric]{mk[0]}[/]:")
                         metric_printed = True
                     abs_r, abs_s, word = _orient_ratio(mr.display_ratio, mr.sigma)
                     lines.append(
@@ -424,7 +426,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
         if not suites_in_order:
             return
 
-        lines.append(f"\n{TUI.BOLD}Summary (geometric mean of ratios):{TUI.RESET}")
+        lines.append(f"\n[benchr.label]Summary (geometric mean of ratios):[/]")
 
         def sum_counts(groups: list[BenchmarkGroup]) -> BenchmarkRunCounts:
             f = s = 0
@@ -435,7 +437,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
 
         for suite in suites_in_order:
             suite_groups = [g for g in baseline.benchmarks if g.suite == suite]
-            lines.append(f"  {TUI.BOLD}{suite}:{TUI.RESET}")
+            lines.append(f"  [benchr.label]{suite}:[/]")
 
             lines.append("    runs:")
             lines.append(
@@ -465,7 +467,7 @@ class DefaultSummaryFormatter(SummaryFormatter):
                     if gmr is None:
                         continue
                     if not metric_printed:
-                        lines.append(f"    {TUI.CYAN}{mk[0]}{TUI.RESET}:")
+                        lines.append(f"    [benchr.metric]{mk[0]}[/]:")
                         metric_printed = True
                     abs_r, abs_s, word = _orient_ratio(gmr.display_ratio, gmr.sigma)
                     lines.append(
@@ -657,7 +659,7 @@ class SummaryReporter(Reporter):
         data = build_summary_data(self._result, self._baseline_paths)
         out = self._formatter.format(data)
         if out:
-            print(out)
+            console.print(out)
 
 
 class DirReporter(Reporter):
@@ -738,7 +740,7 @@ def compare_and_print(datasets: list[GroupedResult]):
     data = build_summary_data_from_grouped(datasets)
     out = DefaultSummaryFormatter().format(data)
     if out:
-        print(out)
+        console.print(out)
 
 
 class Executor(abc.ABC):
@@ -895,25 +897,22 @@ class DefaultExecutor(Executor):
             stderr_file.close()
 
     def start_execution(self, execution: Execution) -> None:
-        print(
-            "["
-            + f"{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
-            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
-            + (
-                f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
-                if self.all_executions is not None
-                else ""
-            )
-            + "] "
+        total = (
+            f"/[benchr.progress]{self.all_executions}[/]"
+            if self.all_executions is not None
+            else ""
+        )
+        console.print(
+            f"\\[[benchr.failure]{self.failed_executions}[/]"
+            f"/[benchr.success]{self.finished_executions}[/]"
+            f"{total}] "
             + execution.as_identifier()
-            + "\n",
-            end="",
         )
 
     def error_execution(self, process_result: FailedProcessResult):
         self.failed_executions += 1
         lines = [
-            f"{TUI.RED}{TUI.BOLD}Error in {process_result.execution.as_identifier()}{TUI.RESET}"
+            f"[benchr.failure]Error in {process_result.execution.as_identifier()}[/]"
         ]
         if process_result.returncode == 124:
             lines.append(
@@ -926,7 +925,7 @@ class DefaultExecutor(Executor):
         else:
             # Pre-execution failure (command not found, spawn OSError).
             lines.append(process_result.reason or "Unknown error")
-        print("\n".join(lines), file=sys.stderr)
+        err_console.print("\n".join(lines))
 
     def finalize(self, process_result: ProcessResult) -> None:
         self.finished_executions += 1
@@ -990,20 +989,17 @@ class ParallelExecutor(DefaultExecutor):
     def print_execution(self):
         assert self.last_info is not None
 
-        print(
-            "["
-            + f"{TUI.MAGENTA}{TUI.BOLD}{self.in_process_runs}{TUI.RESET}"
-            + f"/{TUI.RED}{TUI.BOLD}{self.failed_executions}{TUI.RESET}"
-            + f"/{TUI.GREEN}{TUI.BOLD}{self.finished_executions}{TUI.RESET}"
-            + (
-                f"/{TUI.BLUE}{TUI.BOLD}{self.all_executions}{TUI.RESET}"
-                if self.all_executions is not None
-                else ""
-            )
-            + "] "
+        total = (
+            f"/[benchr.progress]{self.all_executions}[/]"
+            if self.all_executions is not None
+            else ""
+        )
+        console.print(
+            f"\\[[benchr.in_process]{self.in_process_runs}[/]"
+            f"/[benchr.failure]{self.failed_executions}[/]"
+            f"/[benchr.success]{self.finished_executions}[/]"
+            f"{total}] "
             + self.last_info
-            + "\n",
-            end="",
         )
 
     def start_execution(self, execution: Execution) -> None:

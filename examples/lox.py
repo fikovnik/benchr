@@ -10,7 +10,7 @@ conf = (
                 benchmarks=lambda ps: list(
                     filter(
                         lambda b: b.name != "zoo_batch",
-                        Benchmark.from_folder(ps.cwd / "benchmarks", extension="lox"),
+                        Benchmark.from_files(ps.cwd / "benchmarks", pattern=r"\.lox$"),
                     )
                 ),
                 parser=(

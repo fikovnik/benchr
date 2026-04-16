@@ -70,8 +70,8 @@ def test_benchmark_from_files():
     assert benchmarks[1].keys.path == p2
 
 
-def test_benchmark_from_folder(tmp_path):
-    """Benchmark.from_folder creates benchmarks filtered by extension."""
+def test_benchmark_from_files_directory(tmp_path):
+    """Benchmark.from_files with a directory creates benchmarks filtered by pattern."""
     (tmp_path / "a.py").write_text("pass")
     (tmp_path / "b.py").write_text("pass")
     (tmp_path / "c.txt").write_text("hello")
@@ -79,7 +79,7 @@ def test_benchmark_from_folder(tmp_path):
     sub.mkdir()
     (sub / "d.py").write_text("pass")
 
-    benchmarks = Benchmark.from_folder(tmp_path, extension="py")
+    benchmarks = Benchmark.from_files(tmp_path, pattern=r"\.py$")
     names = sorted(b.name for b in benchmarks)
     assert len(names) == 3
     assert "a" in names
